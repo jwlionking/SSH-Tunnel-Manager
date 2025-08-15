@@ -95,7 +95,7 @@ class TunnelManager:
         if not headless:
             self.root = tk.Tk()
             self.root.title("SSH Reverse Tunnel Manager")
-            self.root.geometry("800x600")
+            self.root.geometry("1000x700")
             self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
             self.create_widgets()
             
@@ -244,7 +244,7 @@ class TunnelManager:
         self.status_detail.pack(anchor=tk.W, pady=(5, 0))
     
     def create_tunnels_tab(self):
-        """Create the main Tunnels tab showing all saved tunnels with status"""
+        """Create the main Tunnels tab showing all saved tunnels with status, grouped by connection"""
         self.tunnels_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.tunnels_frame, text="🔗 Tunnels")
         
@@ -267,26 +267,28 @@ class TunnelManager:
         list_frame = ttk.LabelFrame(self.tunnels_frame, text="Saved Tunnels", padding=10)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(10, 20))
         
-        # Create treeview for tunnel list
-        columns = ('Name', 'Connection', 'Ports', 'Description', 'Status', 'PID', 'Duration')
-        self.tunnel_tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=12)
+        # Create hierarchical treeview for tunnel list
+        # Use the implicit '#0' column for Connection (tree column)
+        columns = ('Name', 'Ports', 'Description', 'Status', 'PID', 'Duration')
+        self.tunnel_tree = ttk.Treeview(list_frame, columns=columns, show='tree headings', height=12)
         
-        # Configure columns
+        # Configure headings
+        self.tunnel_tree.heading('#0', text='Connection')
         self.tunnel_tree.heading('Name', text='Tunnel Name')
-        self.tunnel_tree.heading('Connection', text='Connection')
         self.tunnel_tree.heading('Ports', text='Port Mappings')
         self.tunnel_tree.heading('Description', text='Description')
         self.tunnel_tree.heading('Status', text='Status')
         self.tunnel_tree.heading('PID', text='PID')
         self.tunnel_tree.heading('Duration', text='Uptime')
         
-        self.tunnel_tree.column('Name', width=120)
-        self.tunnel_tree.column('Connection', width=150)
-        self.tunnel_tree.column('Ports', width=120)
-        self.tunnel_tree.column('Description', width=150)
-        self.tunnel_tree.column('Status', width=80, anchor=tk.CENTER)
-        self.tunnel_tree.column('PID', width=60, anchor=tk.CENTER)
-        self.tunnel_tree.column('Duration', width=80, anchor=tk.CENTER)
+        # Configure columns
+        self.tunnel_tree.column('#0', width=180)
+        self.tunnel_tree.column('Name', width=150)
+        self.tunnel_tree.column('Ports', width=140)
+        self.tunnel_tree.column('Description', width=180)
+        self.tunnel_tree.column('Status', width=90, anchor=tk.CENTER)
+        self.tunnel_tree.column('PID', width=70, anchor=tk.CENTER)
+        self.tunnel_tree.column('Duration', width=90, anchor=tk.CENTER)
         
         # Scrollbar for treeview
         tree_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tunnel_tree.yview)
@@ -312,6 +314,8 @@ class TunnelManager:
                   command=self.stop_selected_tunnel, style='Danger.TButton').pack(side=tk.LEFT, padx=2)
         ttk.Button(left_buttons, text="🔄 Restart", 
                   command=self.restart_selected_tunnel).pack(side=tk.LEFT, padx=2)
+        ttk.Button(left_buttons, text="🔁 Restart All in Connection", 
+                  command=self.restart_all_under_connection).pack(side=tk.LEFT, padx=6)
         
         # Right side - configuration management
         right_buttons = ttk.Frame(action_frame)
@@ -438,6 +442,7 @@ class TunnelManager:
         self.tunnel_context_menu = tk.Menu(self.root, tearoff=0)
         self.tunnel_context_menu.add_command(label="🛑 Stop Tunnel", command=self.stop_selected_tunnel)
         self.tunnel_context_menu.add_command(label="🔄 Restart Tunnel", command=self.restart_selected_tunnel)
+        self.tunnel_context_menu.add_command(label="🔁 Restart All in Connection", command=self.restart_all_under_connection)
         self.tunnel_context_menu.add_separator()
         self.tunnel_context_menu.add_command(label="📊 View Details", command=self.view_tunnel_details)
         self.tunnel_context_menu.add_command(label="📋 Copy Command", command=self.copy_tunnel_command)
@@ -808,9 +813,9 @@ class TunnelManager:
             creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
         
         self.process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE,
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             creationflags=creation_flags
         )
         
@@ -909,8 +914,21 @@ class TunnelManager:
     
     # Tunnel Management Methods
     def add_tunnel_dialog(self):
-        """Open dialog to add a new tunnel configuration"""
-        self.tunnel_config_dialog()
+        """Open dialog to add a new tunnel configuration. Prefills connection if selected."""
+        prefill = None
+        try:
+            if hasattr(self, 'tunnel_tree'):
+                selection = self.tunnel_tree.selection()
+                if selection:
+                    item = selection[0]
+                    # Determine connection text (user@host)
+                    connection_text = self.get_connection_for_item(item)
+                    if connection_text and '@' in connection_text:
+                        user, host = connection_text.split('@', 1)
+                        prefill = {'user': user, 'host': host}
+        except Exception:
+            pass
+        self.tunnel_config_dialog(prefill=prefill)
     
     def edit_selected_tunnel(self):
         """Edit the selected tunnel configuration"""
@@ -940,7 +958,8 @@ class TunnelManager:
         tunnel_name = values[0]
         status = values[3]
         
-        if "Running" in status:
+        # Prevent starting if already active or detected externally
+        if "Active" in status or "External" in status:
             messagebox.showinfo("Already Running", "This tunnel is already running.")
             return
         
@@ -961,7 +980,8 @@ class TunnelManager:
         tunnel_name = values[0]
         status = values[3]
         
-        if "Running" in status:
+        # Do not allow deleting if running (active or external)
+        if "Active" in status or "External" in status:
             messagebox.showwarning("Cannot Delete", "Stop the tunnel before deleting its configuration.")
             return
         
@@ -976,7 +996,7 @@ class TunnelManager:
         else:
             messagebox.showwarning("Cannot Delete", "This is a running process, not a saved configuration.")
     
-    def tunnel_config_dialog(self, existing_config=None):
+    def tunnel_config_dialog(self, existing_config=None, prefill=None):
         """Open dialog to add/edit tunnel configuration"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Add Tunnel" if not existing_config else "Edit Tunnel")
@@ -1076,6 +1096,13 @@ class TunnelManager:
             toggle_password_field()
             
             name_entry.config(state='readonly')  # Don't allow name changes when editing
+        else:
+            # Apply prefill if provided when adding a new tunnel
+            if prefill:
+                if prefill.get('user'):
+                    user_entry.insert(0, prefill['user'])
+                if prefill.get('host'):
+                    host_entry.insert(0, prefill['host'])
         
         # Buttons
         button_frame = ttk.Frame(main_frame)
@@ -1248,8 +1275,8 @@ class TunnelManager:
                     sshpass_cmd = ['sshpass', '-p', password] + cmd
                     process = subprocess.Popen(
                         sshpass_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
                         creationflags=creation_flags
                     )
                 except (FileNotFoundError, subprocess.CalledProcessError):
@@ -1265,8 +1292,8 @@ class TunnelManager:
                         
                         process = subprocess.Popen(
                             ['cmd', '/c', batch_file],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
                             creationflags=creation_flags
                         )
                         
@@ -1304,16 +1331,16 @@ class TunnelManager:
                             process = subprocess.Popen(
                                 cmd,
                                 stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
                                 creationflags=creation_flags
                             )
             else:
                 # SSH key authentication
                 process = subprocess.Popen(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE,
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     creationflags=creation_flags
                 )
             
@@ -1762,67 +1789,75 @@ class TunnelManager:
         try:
             logging.info("Initiating graceful shutdown...")
             self.running = False
-            
-            # Stop any running tunnel process
+
+            # Stop system tray icon early to avoid blocking
+            if hasattr(self, 'icon') and self.icon:
+                try:
+                    self.icon.stop()
+                    logging.info("System tray icon stopped")
+                except Exception as e:
+                    logging.error(f"Error stopping system tray: {e}")
+                finally:
+                    self.icon = None
+
+            # Stop any running tunnel process tracked by self.process
             if hasattr(self, 'process') and self.process:
                 try:
-                    self._stop_tunnel_process()
-                    logging.info("Tunnel process stopped")
+                    proc = self.process
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                    logging.info("Primary tunnel process stopped")
                 except Exception as e:
-                    logging.error(f"Error stopping tunnel process: {e}")
-            
+                    logging.error(f"Error stopping primary tunnel process: {e}")
+                finally:
+                    self.process = None
+
             # Stop any active tunnels started by this app
             if hasattr(self, '_active_tunnels'):
                 for tunnel_name, tunnel_info in list(self._active_tunnels.items()):
                     try:
-                        process = tunnel_info['process']
-                        if process.poll() is None:  # Still running
+                        process = tunnel_info.get('process')
+                        if process and process.poll() is None:
                             process.terminate()
+                            try:
+                                process.wait(timeout=5)
+                            except Exception:
+                                process.kill()
                             logging.info(f"Terminated active tunnel: {tunnel_name}")
                     except Exception as e:
                         logging.error(f"Error stopping active tunnel {tunnel_name}: {e}")
-            
-            # Stop system tray icon FIRST to prevent blocking
-            if hasattr(self, 'icon') and self.icon:
-                try:
-                    # Set icon to None first to prevent any further calls
-                    icon_ref = self.icon
-                    self.icon = None
-                    icon_ref.stop()
-                    logging.info("System tray icon stopped")
-                except Exception as e:
-                    logging.error(f"Error stopping system tray: {e}")
-            
+                self._active_tunnels.clear()
+
+            # Close file logging to release file handles
+            try:
+                close_file_logging()
+            except Exception as e:
+                logging.error(f"Error closing file logging: {e}")
+
             # Close GUI
             if not self.headless and hasattr(self, 'root'):
                 try:
-                    # Use after_idle to ensure clean shutdown
-                    self.root.after_idle(lambda: (
-                        self.root.quit(),
-                        self.root.destroy()
-                    ))
-                    logging.info("GUI shutdown scheduled")
+                    self.root.quit()
+                    self.root.destroy()
+                    logging.info("GUI closed")
                 except Exception as e:
                     logging.error(f"Error closing GUI: {e}")
-                    # Force quit if normal shutdown fails
-                    try:
-                        self.root.quit()
-                        self.root.destroy()
-                    except:
-                        pass
-            
+
             logging.info("Application shutdown complete")
             
         except Exception as e:
             logging.error(f"Error during shutdown: {e}")
         finally:
-            # Use os._exit for immediate termination if needed
-            import os
-            os._exit(0)
+            # Return to caller; allow normal interpreter shutdown
+            return
     
     # Enhanced UI Methods
     def update_tunnel_list(self):
-        """Update the tunnel list showing all saved tunnels with their status"""
+        """Update the tunnel list showing all saved tunnels with their status, grouped by connection"""
         if self.headless or not hasattr(self, 'tunnel_tree'):
             return
         
@@ -1839,50 +1874,56 @@ class TunnelManager:
             
             logging.info(f"Displaying {tunnel_count} saved tunnels")
             
-            # Display all saved tunnel configurations
+            # Group tunnels by connection (user@host)
+            connections = {}
             for tunnel_name, config in self._saved_tunnels.items():
                 user_host = f"{config['user']}@{config['host']}"
-                ports = config['ports']
-                description = config.get('description', '')
-                
-                # Check if this tunnel is currently running
-                running_pid = None
-                running_duration = "-"
-                status = "⚫ Stopped"
-                
-                # Check in active tunnels first (tunnels started by this app)
-                if tunnel_name in self._active_tunnels:
-                    process = self._active_tunnels[tunnel_name]['process']
-                    if process.poll() is None:  # Still running
-                        running_pid = process.pid
-                        start_time = self._active_tunnels[tunnel_name]['start_time']
-                        running_duration = self.format_duration(time.time() - start_time)
-                        status = "🟢 Active"
-                    else:
-                        # Process died, remove from active tunnels
-                        del self._active_tunnels[tunnel_name]
-                        logging.info(f"Removed dead process for tunnel: {tunnel_name}")
-                
-                # Also check in SSH processes (in case started externally)
-                if not running_pid:
-                    for proc_info in ssh_processes.values():
-                        if (user_host in proc_info.get('user_host', '') and 
-                            ports in proc_info.get('ports', '')):
-                            running_pid = proc_info['pid']
-                            running_duration = self.format_duration(time.time() - proc_info['create_time'])
-                            status = "🟡 External"
-                            break
-                
-                # Insert saved tunnel configuration with status
-                self.tunnel_tree.insert('', 'end', values=(
-                    tunnel_name, 
-                    user_host, 
-                    ports, 
-                    description,
-                    status, 
-                    running_pid if running_pid else "-", 
-                    running_duration
-                ))
+                connections.setdefault(user_host, []).append((tunnel_name, config))
+
+            # Insert groups and children
+            for user_host, items in sorted(connections.items()):
+                parent_id = self.tunnel_tree.insert('', 'end', text=user_host, open=True)
+                for tunnel_name, config in items:
+                    ports = config['ports']
+                    description = config.get('description', '')
+
+                    # Check if this tunnel is currently running
+                    running_pid = None
+                    running_duration = "-"
+                    status = "⚫ Stopped"
+
+                    # Check in active tunnels first (tunnels started by this app)
+                    if tunnel_name in self._active_tunnels:
+                        process = self._active_tunnels[tunnel_name]['process']
+                        if process.poll() is None:  # Still running
+                            running_pid = process.pid
+                            start_time = self._active_tunnels[tunnel_name]['start_time']
+                            running_duration = self.format_duration(time.time() - start_time)
+                            status = "🟢 Active"
+                        else:
+                            # Process died, remove from active tunnels
+                            del self._active_tunnels[tunnel_name]
+                            logging.info(f"Removed dead process for tunnel: {tunnel_name}")
+
+                    # Also check in SSH processes (in case started externally)
+                    if not running_pid:
+                        for proc_info in ssh_processes.values():
+                            if (user_host in proc_info.get('user_host', '') and 
+                                ports in proc_info.get('ports', '')):
+                                running_pid = proc_info['pid']
+                                running_duration = self.format_duration(time.time() - proc_info['create_time'])
+                                status = "🟡 External"
+                                break
+
+                    # Insert child row under connection parent
+                    self.tunnel_tree.insert(parent_id, 'end', values=(
+                        tunnel_name,
+                        ports,
+                        description,
+                        status,
+                        running_pid if running_pid else "-",
+                        running_duration
+                    ))
             
             # Update status bar
             active_count = len([t for t in self._saved_tunnels.keys() if t in self._active_tunnels])
@@ -1952,9 +1993,13 @@ class TunnelManager:
             
             item = selection[0]
             values = self.tunnel_tree.item(item, 'values')
+            # If a parent (connection) node is selected, do nothing
+            if not values:
+                messagebox.showwarning("Invalid Selection", "Select a specific tunnel under a connection.")
+                return
             tunnel_name = values[0]  # First column is tunnel name
-            connection = values[1]   # Second column is connection
-            pid_str = values[5]      # PID is in the 6th column
+            connection = self.get_connection_for_item(item)   # Connection from parent text
+            pid_str = values[4]      # PID is in the 5th value column now
             
             if pid_str == "-":
                 messagebox.showwarning("No Process", "This tunnel is not currently running.")
@@ -2006,6 +2051,16 @@ class TunnelManager:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to stop tunnel: {e}")
             logging.error(f"Error stopping selected tunnel: {e}")
+
+    def get_connection_for_item(self, item_id):
+        """Helper to derive connection text (user@host) for a tree item."""
+        try:
+            parent = self.tunnel_tree.parent(item_id)
+            if parent:
+                return self.tunnel_tree.item(parent, 'text')
+            return self.tunnel_tree.item(item_id, 'text')
+        except Exception:
+            return ""
     
     def stop_all_tunnels(self):
         """Stop all running tunnels"""
@@ -2054,17 +2109,31 @@ class TunnelManager:
             
             item = selection[0]
             values = self.tunnel_tree.item(item, 'values')
-            pid = int(values[0])
+            # If a parent (connection) node is selected, do nothing
+            if not values:
+                messagebox.showwarning("Invalid Selection", "Select a specific tunnel under a connection.")
+                return
+            tunnel_name = values[0]
+            connection = self.get_connection_for_item(item)
+            ports = values[1]
+            status = values[3]
+            duration = values[5]
+            pid_str = values[4]
+            if pid_str == "-":
+                messagebox.showinfo("Tunnel Details", f"Tunnel Details:\n\nName: {tunnel_name}\nConnection: {connection}\nPort Mappings: {ports}\nStatus: {status}\nUptime: {duration}\n\nNo process is currently associated with this tunnel.")
+                return
+            pid = int(pid_str)
             
             try:
                 proc = psutil.Process(pid)
                 info = f"""Tunnel Details:
 
+Name: {tunnel_name}
 Process ID: {pid}
-Connection: {values[1]}
-Port Mappings: {values[2]}
-Status: {values[3]}
-Uptime: {values[4]}
+Connection: {connection}
+Port Mappings: {ports}
+Status: {status}
+Uptime: {duration}
 
 Process Info:
 Executable: {proc.exe()}
@@ -2092,30 +2161,37 @@ Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M
             
             item = selection[0]
             values = self.tunnel_tree.item(item, 'values')
-            pid = int(values[0])
-            user_host = values[1]
+            if not values:
+                messagebox.showwarning("Invalid Selection", "Select a specific tunnel under a connection.")
+                return
+            tunnel_name = values[0]
+            pid_str = values[4]
+            user_host = self.get_connection_for_item(item)
             
-            # Get the command line to recreate the tunnel
             try:
-                proc = psutil.Process(pid)
-                cmdline = proc.cmdline()
-                
-                # Stop the current tunnel
-                proc.terminate()
-                proc.wait(timeout=5)
-                
-                # Start new tunnel with same parameters
-                subprocess.Popen(cmdline, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                
-                messagebox.showinfo("Success", f"Tunnel {user_host} restarted successfully.")
-                logging.info(f"Restarted tunnel {user_host} (was PID: {pid})")
-                self.refresh_tunnels()
+                # If a process exists, stop it first
+                if pid_str and pid_str != "-":
+                    pid = int(pid_str)
+                    proc = psutil.Process(pid)
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                # Start from saved configuration
+                if tunnel_name in self._saved_tunnels:
+                    self.start_saved_tunnel(tunnel_name)
+                    messagebox.showinfo("Success", f"Tunnel {tunnel_name} ({user_host}) restarted successfully.")
+                    logging.info(f"Restarted tunnel {tunnel_name} ({user_host})")
+                    self.refresh_tunnels()
+                else:
+                    messagebox.showwarning("Not Managed", "This tunnel is not a saved configuration.")
                 
             except psutil.NoSuchProcess:
                 messagebox.showerror("Error", "The selected process no longer exists.")
                 self.refresh_tunnels()
             except psutil.TimeoutExpired:
-                proc.kill()
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
                 messagebox.showwarning("Warning", "Had to force-kill the tunnel. Please start manually.")
                 
         except Exception as e:
@@ -2132,6 +2208,88 @@ Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M
                 self.tunnel_context_menu.post(event.x_root, event.y_root)
         except Exception as e:
             logging.error(f"Error showing context menu: {e}")
+
+    def get_connection_for_item(self, item_id):
+        """Return the connection label (user@host) for a given tree item.
+        If the item is a child, return its parent's text. If it's a parent, return its own text."""
+        try:
+            parent = self.tunnel_tree.parent(item_id)
+            if parent:
+                return self.tunnel_tree.item(parent, 'text') or ""
+            # parentless -> it's a top-level connection node
+            return self.tunnel_tree.item(item_id, 'text') or ""
+        except Exception as e:
+            logging.error(f"Error getting connection for item: {e}")
+            return ""
+
+    def restart_all_under_connection(self):
+        """Restart all tunnels that belong to the selected connection (parent node).
+        If a child tunnel is selected, applies to its parent connection."""
+        try:
+            selection = self.tunnel_tree.selection()
+            if not selection:
+                messagebox.showwarning("No Selection", "Please select a connection or a tunnel under it.")
+                return
+            item = selection[0]
+            values = self.tunnel_tree.item(item, 'values')
+
+            # Determine parent connection node and list of children
+            parent = item if not values else self.tunnel_tree.parent(item)
+            if not parent:
+                # If values present but no parent, treat as invalid
+                messagebox.showwarning("Invalid Selection", "Please select a connection group or a tunnel under it.")
+                return
+            connection = self.tunnel_tree.item(parent, 'text')
+            children = self.tunnel_tree.get_children(parent)
+
+            restarted = 0
+            errors = []
+            for child in children:
+                cvals = self.tunnel_tree.item(child, 'values')
+                if not cvals:
+                    continue
+                tunnel_name = cvals[0]
+                pid_str = cvals[4] if len(cvals) > 4 else "-"
+                # Stop existing process if any
+                try:
+                    if pid_str and pid_str != "-":
+                        pid = int(pid_str)
+                        proc = psutil.Process(pid)
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except psutil.TimeoutExpired:
+                            proc.kill()
+                except psutil.NoSuchProcess:
+                    pass
+                except Exception as e:
+                    errors.append(f"{tunnel_name}: stop error {e}")
+                # Start from saved config
+                try:
+                    if tunnel_name in self._saved_tunnels:
+                        self.start_saved_tunnel(tunnel_name)
+                        restarted += 1
+                    else:
+                        errors.append(f"{tunnel_name}: not a saved configuration")
+                except Exception as e:
+                    errors.append(f"{tunnel_name}: start error {e}")
+
+            # Refresh UI after batch
+            self.refresh_tunnels()
+
+            # Report outcome
+            if errors:
+                messagebox.showwarning(
+                    "Restart Completed with Issues",
+                    f"Connection: {connection}\nRestarted: {restarted}\nIssues: {len(errors)}\n\n" + "\n".join(errors[:10]) + ("\n..." if len(errors) > 10 else "")
+                )
+            else:
+                messagebox.showinfo("Success", f"Restarted {restarted} tunnel(s) under {connection}.")
+            logging.info(f"Restarted {restarted} tunnel(s) under {connection}; errors: {len(errors)}")
+
+        except Exception as e:
+            logging.error(f"Error restarting all tunnels under connection: {e}")
+            messagebox.showerror("Error", f"Failed to restart all tunnels: {e}")
     
     def copy_tunnel_command(self):
         """Copy the SSH command of selected tunnel to clipboard"""
@@ -2143,11 +2301,39 @@ Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M
             
             item = selection[0]
             values = self.tunnel_tree.item(item, 'values')
-            pid = int(values[0])
+            if not values:
+                messagebox.showwarning("Invalid Selection", "Select a specific tunnel under a connection.")
+                return
+            tunnel_name = values[0]
+            pid_str = values[4]
             
             try:
-                proc = psutil.Process(pid)
-                cmdline = ' '.join(proc.cmdline())
+                cmdline = None
+                if pid_str and pid_str != "-":
+                    proc = psutil.Process(int(pid_str))
+                    cmdline = ' '.join(proc.cmdline())
+                else:
+                    # Build command from saved configuration
+                    if tunnel_name not in self._saved_tunnels:
+                        messagebox.showwarning("Not Managed", "This tunnel is not a saved configuration.")
+                        return
+                    config = self._saved_tunnels[tunnel_name]
+                    r_flags = []
+                    for pair in config['ports'].split(','):
+                        pair = pair.strip()
+                        if ':' in pair:
+                            remote, local = pair.split(':')
+                            r_flags.extend(['-R', f'{remote.strip()}:localhost:{local.strip()}'])
+                    base = [
+                        'ssh',
+                        '-o', 'StrictHostKeyChecking=no',
+                        '-o', 'UserKnownHostsFile=NUL',
+                        '-o', 'BatchMode=yes',
+                        '-o', 'ConnectTimeout=10',
+                        '-o', 'ServerAliveInterval=60',
+                        '-o', 'ServerAliveCountMax=3'
+                    ] + r_flags + ['-N', f"{config['user']}@{config['host']}"]
+                    cmdline = ' '.join(base)
                 
                 # Copy to clipboard
                 self.root.clipboard_clear()
@@ -2427,41 +2613,12 @@ Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M
             logging.error(f"Error decrypting password: {e}")
             return encrypted_password
     
-    def quit_app(self):
-        """Properly shutdown the application and cleanup resources"""
+    def quit_app_legacy(self):
+        """Deprecated: retained to avoid method name override. Do not use."""
         try:
-            logging.info("Shutting down application...")
-            
-            # Close file logging to release file handles
-            close_file_logging()
-            
-            # Stop any running processes
-            if hasattr(self, 'process') and self.process:
-                try:
-                    self.process.terminate()
-                except:
-                    pass
-            
-            # Stop system tray icon
-            if hasattr(self, 'icon') and self.icon:
-                try:
-                    self.icon.stop()
-                except:
-                    pass
-            
-            # Close GUI if running
-            if not self.headless and hasattr(self, 'root'):
-                try:
-                    self.root.quit()
-                    self.root.destroy()
-                except:
-                    pass
-                    
-        except Exception as e:
-            print(f"Error during shutdown: {e}")
-        finally:
-            # Force exit
-            sys.exit(0)
+            self.quit_app()
+        except Exception:
+            pass
     
     def run(self):
         """Run the application"""
@@ -2469,7 +2626,20 @@ Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M
             # Run in headless mode
             logging.info("Starting in headless mode")
             self.icon = self.create_tray_icon()
-            self.icon.run()
+            try:
+                # Do not block the terminal; run the tray loop detached
+                self.icon.run_detached()
+            except AttributeError:
+                # Fallback for older pystray: run in a daemon thread
+                threading.Thread(target=self.icon.run, daemon=True).start()
+                # Keep the process alive until interrupted
+                try:
+                    while self.running:
+                        time.sleep(0.5)
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    self.quit_app()
         else:
             # Run with GUI
             self.root.mainloop()

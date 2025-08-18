@@ -1,2 +1,28 @@
-# Ignore local configuration
+# Local config and logs
 /tunnel_manager.ini
+/tunnel_manager.log
+*.log
+
+# Python cache and virtualenvs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+ENV/
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe
+*.dll
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/

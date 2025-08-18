@@ -5,7 +5,7 @@ a = Analysis(
     ['tunnel_manager.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('tunnel_manager.ini', '.')],
     hiddenimports=['pystray._win32', 'PIL._tkinter_finder'],
     hookspath=[],
     hooksconfig={},

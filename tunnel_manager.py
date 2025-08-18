@@ -1,5 +1,6 @@
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox
+import tunnel_ui
 import subprocess
 import os
 import psutil
@@ -14,6 +15,17 @@ import logging
 from datetime import datetime
 import argparse
 import signal
+from logger_utils import init_logging, setup_file_logging, close_file_logging, LOG_FILE
+from config_store import (
+    load_saved_tunnels as cs_load_saved_tunnels,
+    save_tunnel_config as cs_save_tunnel_config,
+    delete_tunnel_config as cs_delete_tunnel_config,
+    save_tunnel_pid as cs_save_tunnel_pid,
+    clear_tunnel_pid as cs_clear_tunnel_pid,
+    encrypt_password as cs_encrypt_password,
+    decrypt_password as cs_decrypt_password,
+)
+import process_utils as pu
 
 # Config file to save settings - use absolute path to ensure persistence
 # Detect if running as executable or script and use appropriate directory
@@ -25,50 +37,35 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE = os.path.join(APP_DIR, 'tunnel_manager.ini')
-LOG_FILE = os.path.join(APP_DIR, 'tunnel_manager.log')
 
-# Setup logging - configure later to allow file operations
-# Initial setup without file handler to prevent file locking
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler() if '--debug' in sys.argv else logging.NullHandler()
-    ]
-)
+# Initialize base logging (console only if debug flag present)
+DEBUG_MODE = ('--debug' in sys.argv)
+init_logging(DEBUG_MODE)
 
-# Global variable to track file handler
-_log_file_handler = None
-
-def setup_file_logging():
-    """Setup file logging handler - called after app initialization"""
-    global _log_file_handler
-    try:
-        if _log_file_handler is None:
-            _log_file_handler = logging.FileHandler(LOG_FILE)
-            _log_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-            logging.getLogger().addHandler(_log_file_handler)
-            logging.info("File logging initialized")
-    except Exception as e:
-        print(f"Warning: Could not setup file logging: {e}")
-
-def close_file_logging():
-    """Close file logging handler to allow file operations"""
-    global _log_file_handler
-    try:
-        if _log_file_handler:
-            logging.getLogger().removeHandler(_log_file_handler)
-            _log_file_handler.close()
-            _log_file_handler = None
-            logging.info("File logging closed")
-    except Exception as e:
-        print(f"Warning: Could not close file logging: {e}")
+# Silence GUI popups: route messagebox show* to logging only
+try:
+    def _mb_showinfo(title, message):
+        logging.info(f"{title}: {message}")
+    def _mb_showwarning(title, message):
+        logging.warning(f"{title}: {message}")
+    def _mb_showerror(title, message):
+        logging.error(f"{title}: {message}")
+    messagebox.showinfo = _mb_showinfo
+    messagebox.showwarning = _mb_showwarning
+    messagebox.showerror = _mb_showerror
+except Exception:
+    pass
 
 class TunnelManager:
     def __init__(self, headless=False):
         self.headless = headless
         self.process = None
         self.config = configparser.ConfigParser()
+        # Detect if launched from a console/terminal to decide close behavior
+        try:
+            self._launched_from_console = sys.stdout.isatty()
+        except Exception:
+            self._launched_from_console = False
         
         # Setup file logging after initialization
         setup_file_logging()
@@ -93,362 +90,12 @@ class TunnelManager:
         
         # GUI elements (only if not headless)
         if not headless:
-            self.root = tk.Tk()
-            self.root.title("SSH Reverse Tunnel Manager")
-            self.root.geometry("1000x700")
-            self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-            self.create_widgets()
-            
-            # Populate tunnel list after GUI is created
-            self.update_tunnel_list()
+            # Delegate UI construction to tunnel_ui module
+            tunnel_ui.create_widgets(self)
         
         # Auto-start tunnel if enabled
         if self.config.getboolean('Settings', 'auto_start', fallback=False):
             self.start_tunnel_background()
-    
-    def create_widgets(self):
-        # Configure modern styling
-        self.setup_modern_style()
-        
-        # Create notebook for tabbed interface
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
-        # Create tabs
-        self.create_tunnels_tab()
-        self.create_settings_tab()
-        self.create_logs_tab()
-        
-        # Status bar at bottom
-        self.create_status_bar()
-        
-        # Start periodic updates with optimized intervals
-        self.schedule_updates()
-        
-        # Bind window focus events for adaptive updates
-        self.root.bind('<FocusIn>', self.on_window_focus)
-        self.root.bind('<FocusOut>', self.on_window_unfocus)
-        
-        # Bind tab change events to refresh data
-        self.notebook.bind('<<NotebookTabChanged>>', self.on_tab_changed)
-    
-    def setup_modern_style(self):
-        """Configure modern, professional styling"""
-        style = ttk.Style()
-        
-        # Configure colors and fonts
-        self.colors = {
-            'primary': '#2E86AB',      # Professional blue
-            'secondary': '#A23B72',    # Accent purple
-            'success': '#28A745',      # Success green
-            'warning': '#FFC107',      # Warning yellow
-            'danger': '#DC3545',       # Error red
-            'dark': '#343A40',         # Dark text
-            'light': '#F8F9FA',        # Light background
-            'white': '#FFFFFF'
-        }
-        
-        # Configure ttk styles
-        style.configure('Title.TLabel', font=('Segoe UI', 14, 'bold'), foreground=self.colors['dark'])
-        style.configure('Heading.TLabel', font=('Segoe UI', 11, 'bold'), foreground=self.colors['primary'])
-        style.configure('Status.TLabel', font=('Segoe UI', 10, 'bold'))
-        style.configure('Success.TLabel', foreground=self.colors['success'])
-        style.configure('Warning.TLabel', foreground=self.colors['warning'])
-        style.configure('Danger.TLabel', foreground=self.colors['danger'])
-        
-        # Button styles
-        style.configure('Primary.TButton', font=('Segoe UI', 9, 'bold'))
-        style.configure('Success.TButton', font=('Segoe UI', 9))
-        style.configure('Danger.TButton', font=('Segoe UI', 9))
-    
-    def create_connection_tab(self):
-        """Create the connection configuration tab"""
-        conn_frame = ttk.Frame(self.notebook)
-        self.notebook.add(conn_frame, text="🔗 Connection")
-        
-        # Main container with padding
-        main_container = ttk.Frame(conn_frame)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        # Title
-        title_label = ttk.Label(main_container, text="SSH Connection Configuration", style='Title.TLabel')
-        title_label.pack(anchor=tk.W, pady=(0, 20))
-        
-        # Connection details frame
-        details_frame = ttk.LabelFrame(main_container, text="Server Details", padding=15)
-        details_frame.pack(fill=tk.X, pady=(0, 20))
-        
-        # VPS Username
-        user_frame = ttk.Frame(details_frame)
-        user_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(user_frame, text="Username:", style='Heading.TLabel').pack(anchor=tk.W)
-        self.user_entry = ttk.Entry(user_frame, font=('Segoe UI', 10), width=40)
-        self.user_entry.pack(fill=tk.X, pady=(5, 0))
-        self.user_entry.insert(0, self.config.get('VPS', 'user', fallback='root'))
-        
-        # VPS IP
-        ip_frame = ttk.Frame(details_frame)
-        ip_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(ip_frame, text="Server IP Address:", style='Heading.TLabel').pack(anchor=tk.W)
-        self.ip_entry = ttk.Entry(ip_frame, font=('Segoe UI', 10), width=40)
-        self.ip_entry.pack(fill=tk.X, pady=(5, 0))
-        self.ip_entry.insert(0, self.config.get('VPS', 'ip', fallback='31.220.99.112'))
-        
-        # Ports
-        ports_frame = ttk.Frame(details_frame)
-        ports_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(ports_frame, text="Port Mappings (remote:local, comma-separated):", style='Heading.TLabel').pack(anchor=tk.W)
-        self.ports_entry = ttk.Entry(ports_frame, font=('Segoe UI', 10), width=40)
-        self.ports_entry.pack(fill=tk.X, pady=(5, 0))
-        self.ports_entry.insert(0, self.config.get('Tunnel', 'ports', fallback='11434:11434'))
-        
-        # Action buttons
-        action_frame = ttk.Frame(main_container)
-        action_frame.pack(fill=tk.X, pady=10)
-        
-        button_container = ttk.Frame(action_frame)
-        button_container.pack()
-        
-        # Primary action buttons
-        ttk.Button(button_container, text="💾 Save Configuration", 
-                  command=self.save_config, style='Primary.TButton', width=20).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_container, text="🔍 Test Connection", 
-                  command=self.test_ssh_connection, width=20).pack(side=tk.LEFT, padx=5)
-        
-        # Quick actions frame
-        quick_frame = ttk.LabelFrame(main_container, text="Quick Start", padding=15)
-        quick_frame.pack(fill=tk.X, pady=10)
-        
-        quick_buttons = ttk.Frame(quick_frame)
-        quick_buttons.pack()
-        
-        ttk.Button(quick_buttons, text="🚀 Create & Start Tunnel", 
-                  command=self.quick_start_tunnel, style='Success.TButton', width=20).pack(side=tk.LEFT, padx=5)
-        ttk.Button(quick_buttons, text="⏹️ Stop All Tunnels", 
-                  command=self.stop_all_tunnels, style='Danger.TButton', width=15).pack(side=tk.LEFT, padx=5)
-        
-        # Info text
-        info_frame = ttk.Frame(quick_frame)
-        info_frame.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(info_frame, text="ℹ️ This creates a tunnel named 'QuickStart' and starts it immediately.", 
-                 font=('Segoe UI', 9), foreground='#6c757d').pack(anchor=tk.W)
-        
-        # Status display
-        status_frame = ttk.LabelFrame(main_container, text="Connection Status", padding=15)
-        status_frame.pack(fill=tk.X, pady=10)
-        
-        self.status_label = ttk.Label(status_frame, text="● Idle", style='Status.TLabel', font=('Segoe UI', 12, 'bold'))
-        self.status_label.pack(anchor=tk.W)
-        
-        self.status_detail = ttk.Label(status_frame, text="No active connections", font=('Segoe UI', 9))
-        self.status_detail.pack(anchor=tk.W, pady=(5, 0))
-    
-    def create_tunnels_tab(self):
-        """Create the main Tunnels tab showing all saved tunnels with status, grouped by connection"""
-        self.tunnels_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.tunnels_frame, text="🔗 Tunnels")
-        
-        # Header with buttons
-        header_frame = ttk.Frame(self.tunnels_frame)
-        header_frame.pack(fill=tk.X, padx=20, pady=(20, 10))
-        
-        ttk.Label(header_frame, text="SSH Tunnel Manager", style='Title.TLabel').pack(side=tk.LEFT)
-        
-        button_frame = ttk.Frame(header_frame)
-        button_frame.pack(side=tk.RIGHT)
-        
-        ttk.Button(button_frame, text="➕ Add Tunnel", command=self.add_tunnel_dialog, 
-                  style='Success.TButton').pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="🔍 Find External", command=self.find_external_tunnels, 
-                  style='Primary.TButton').pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="🔄 Refresh", command=self.refresh_tunnels).pack(side=tk.LEFT, padx=2)
-        
-        # Tunnels list frame
-        list_frame = ttk.LabelFrame(self.tunnels_frame, text="Saved Tunnels", padding=10)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(10, 20))
-        
-        # Create hierarchical treeview for tunnel list
-        # Use the implicit '#0' column for Connection (tree column)
-        columns = ('Name', 'Ports', 'Description', 'Status', 'PID', 'Duration')
-        self.tunnel_tree = ttk.Treeview(list_frame, columns=columns, show='tree headings', height=12)
-        
-        # Configure headings
-        self.tunnel_tree.heading('#0', text='Connection')
-        self.tunnel_tree.heading('Name', text='Tunnel Name')
-        self.tunnel_tree.heading('Ports', text='Port Mappings')
-        self.tunnel_tree.heading('Description', text='Description')
-        self.tunnel_tree.heading('Status', text='Status')
-        self.tunnel_tree.heading('PID', text='PID')
-        self.tunnel_tree.heading('Duration', text='Uptime')
-        
-        # Configure columns
-        self.tunnel_tree.column('#0', width=180)
-        self.tunnel_tree.column('Name', width=150)
-        self.tunnel_tree.column('Ports', width=140)
-        self.tunnel_tree.column('Description', width=180)
-        self.tunnel_tree.column('Status', width=90, anchor=tk.CENTER)
-        self.tunnel_tree.column('PID', width=70, anchor=tk.CENTER)
-        self.tunnel_tree.column('Duration', width=90, anchor=tk.CENTER)
-        
-        # Scrollbar for treeview
-        tree_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tunnel_tree.yview)
-        self.tunnel_tree.configure(yscrollcommand=tree_scroll.set)
-        
-        self.tunnel_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Context menu for tunnels
-        self.create_tunnel_context_menu()
-        
-        # Action buttons for selected tunnel
-        action_frame = ttk.Frame(self.tunnels_frame)
-        action_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        # Left side - tunnel management
-        left_buttons = ttk.Frame(action_frame)
-        left_buttons.pack(side=tk.LEFT)
-        
-        ttk.Button(left_buttons, text="🚀 Start", 
-                  command=self.start_selected_tunnel, style='Success.TButton').pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_buttons, text="🛑 Stop", 
-                  command=self.stop_selected_tunnel, style='Danger.TButton').pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_buttons, text="🔄 Restart", 
-                  command=self.restart_selected_tunnel).pack(side=tk.LEFT, padx=2)
-        ttk.Button(left_buttons, text="🔁 Restart All in Connection", 
-                  command=self.restart_all_under_connection).pack(side=tk.LEFT, padx=6)
-        
-        # Right side - configuration management
-        right_buttons = ttk.Frame(action_frame)
-        right_buttons.pack(side=tk.RIGHT)
-        
-        ttk.Button(right_buttons, text="✏️ Edit", 
-                  command=self.edit_selected_tunnel).pack(side=tk.LEFT, padx=2)
-        ttk.Button(right_buttons, text="🗑️ Delete", 
-                  command=self.delete_selected_tunnel, style='Danger.TButton').pack(side=tk.LEFT, padx=2)
-        ttk.Button(right_buttons, text="📊 Details", 
-                  command=self.view_tunnel_details).pack(side=tk.LEFT, padx=2)
-    
-    def create_settings_tab(self):
-        """Create the settings and preferences tab"""
-        settings_frame = ttk.Frame(self.notebook)
-        self.notebook.add(settings_frame, text="⚙️ Settings")
-        
-        main_container = ttk.Frame(settings_frame)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        ttk.Label(main_container, text="Application Settings", style='Title.TLabel').pack(anchor=tk.W, pady=(0, 20))
-        
-        # Startup settings
-        startup_frame = ttk.LabelFrame(main_container, text="Startup & Automation", padding=15)
-        startup_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        self.auto_start_var = tk.BooleanVar()
-        self.auto_start_var.set(self.config.getboolean('Settings', 'auto_start', fallback=False))
-        ttk.Checkbutton(startup_frame, text="🚀 Auto-start tunnel when application launches", 
-                       variable=self.auto_start_var, style='TCheckbutton').pack(anchor=tk.W, pady=5)
-        
-        self.start_with_windows_var = tk.BooleanVar()
-        self.start_with_windows_var.set(self.is_startup_enabled())
-        ttk.Checkbutton(startup_frame, text="🪟 Start with Windows (run in system tray)", 
-                       variable=self.start_with_windows_var).pack(anchor=tk.W, pady=5)
-        
-        # UI settings
-        ui_frame = ttk.LabelFrame(main_container, text="User Interface", padding=15)
-        ui_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        self.minimize_to_tray_var = tk.BooleanVar()
-        self.minimize_to_tray_var.set(self.config.getboolean('Settings', 'minimize_to_tray', fallback=True))
-        ttk.Checkbutton(ui_frame, text="📱 Minimize to system tray instead of closing", 
-                       variable=self.minimize_to_tray_var).pack(anchor=tk.W, pady=5)
-        
-        # Advanced settings
-        advanced_frame = ttk.LabelFrame(main_container, text="Advanced Options", padding=15)
-        advanced_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        ttk.Button(advanced_frame, text="📁 Open Config File", 
-                  command=self.open_config_file).pack(side=tk.LEFT, padx=5)
-        ttk.Button(advanced_frame, text="📄 View Log File", 
-                  command=self.view_logs).pack(side=tk.LEFT, padx=5)
-        ttk.Button(advanced_frame, text="🗑️ Clear Logs", 
-                  command=self.clear_logs).pack(side=tk.LEFT, padx=5)
-        
-        # System tray controls
-        tray_frame = ttk.Frame(main_container)
-        tray_frame.pack(fill=tk.X, pady=20)
-        
-        ttk.Button(tray_frame, text="📱 Minimize to Tray", 
-                  command=self.minimize_to_tray, width=20).pack(side=tk.LEFT, padx=5)
-    
-    def create_logs_tab(self):
-        """Create the logs and activity tab"""
-        logs_frame = ttk.Frame(self.notebook)
-        self.notebook.add(logs_frame, text="📋 Activity Log")
-        
-        main_container = ttk.Frame(logs_frame)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        # Header
-        header_frame = ttk.Frame(main_container)
-        header_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        ttk.Label(header_frame, text="Application Activity Log", style='Title.TLabel').pack(side=tk.LEFT)
-        ttk.Button(header_frame, text="🔄 Refresh", command=self.update_log_display).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(header_frame, text="🗑️ Clear", command=self.clear_logs).pack(side=tk.RIGHT)
-        
-        # Log display
-        log_frame = ttk.LabelFrame(main_container, text="Recent Activity", padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Create text widget with scrollbar
-        text_frame = ttk.Frame(log_frame)
-        text_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.log_text = tk.Text(text_frame, wrap=tk.WORD, font=('Consolas', 9), 
-                               bg='#f8f9fa', fg='#343a40', relief=tk.FLAT, padx=10, pady=10)
-        log_scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scrollbar.set)
-        
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Configure text tags for colored output
-        self.log_text.tag_configure('INFO', foreground='#28a745')
-        self.log_text.tag_configure('WARNING', foreground='#ffc107')
-        self.log_text.tag_configure('ERROR', foreground='#dc3545')
-        self.log_text.tag_configure('DEBUG', foreground='#6c757d')
-    
-    def create_status_bar(self):
-        """Create bottom status bar"""
-        status_bar = ttk.Frame(self.root, relief=tk.SUNKEN)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
-        
-        # Connection indicator
-        self.connection_indicator = ttk.Label(status_bar, text="●", foreground='red', font=('Segoe UI', 12))
-        self.connection_indicator.pack(side=tk.LEFT, padx=5)
-        
-        # Status text
-        self.status_bar_text = ttk.Label(status_bar, text="Ready", font=('Segoe UI', 9))
-        self.status_bar_text.pack(side=tk.LEFT, padx=5)
-        
-        # Right side info
-        self.tunnel_count_label = ttk.Label(status_bar, text="Tunnels: 0", font=('Segoe UI', 9))
-        self.tunnel_count_label.pack(side=tk.RIGHT, padx=5)
-        
-        # Update status periodically
-        self.update_status_bar()
-    
-    def create_tunnel_context_menu(self):
-        """Create right-click context menu for tunnel list"""
-        self.tunnel_context_menu = tk.Menu(self.root, tearoff=0)
-        self.tunnel_context_menu.add_command(label="🛑 Stop Tunnel", command=self.stop_selected_tunnel)
-        self.tunnel_context_menu.add_command(label="🔄 Restart Tunnel", command=self.restart_selected_tunnel)
-        self.tunnel_context_menu.add_command(label="🔁 Restart All in Connection", command=self.restart_all_under_connection)
-        self.tunnel_context_menu.add_separator()
-        self.tunnel_context_menu.add_command(label="📊 View Details", command=self.view_tunnel_details)
-        self.tunnel_context_menu.add_command(label="📋 Copy Command", command=self.copy_tunnel_command)
-        
-        # Bind right-click to treeview
-        self.tunnel_tree.bind("<Button-3>", self.show_tunnel_context_menu)
     
     def create_tray_icon(self):
         """Create system tray icon"""
@@ -475,8 +122,8 @@ class TunnelManager:
         if os.path.exists(CONFIG_FILE):
             self.config.read(CONFIG_FILE)
         else:
-            self.config['VPS'] = {'user': 'root', 'ip': '31.220.99.112'}
-            self.config['Tunnel'] = {'ports': '11434:11434'}
+            self.config['VPS'] = {'user': '', 'ip': ''}
+            self.config['Tunnel'] = {'ports': ''}
             self.config['Settings'] = {
                 'auto_start': 'False',
                 'minimize_to_tray': 'True',
@@ -530,22 +177,8 @@ class TunnelManager:
             logging.info("Auto-detecting external tunnels...")
             detected_count = 0
             
-            # Get all running SSH processes
-            ssh_processes = {}
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
-                try:
-                    if proc.name().lower() in ['ssh.exe', 'ssh'] and proc.cmdline():
-                        cmdline = ' '.join(proc.cmdline())
-                        if '-R' in cmdline and '@' in cmdline:
-                            ssh_processes[proc.pid] = {
-                                'pid': proc.pid,
-                                'cmdline': cmdline,
-                                'create_time': proc.create_time(),
-                                'user_host': self.extract_user_host(cmdline),
-                                'ports': self.extract_port_mappings(cmdline)
-                            }
-                except (psutil.NoSuchProcess, psutil.AccessDenied, IndexError):
-                    continue
+            # Get all running SSH processes via process_utils
+            ssh_processes = pu.scan_ssh_tunnels()
             
             # Match running processes to saved tunnel configurations
             for tunnel_name, config in self._saved_tunnels.items():
@@ -756,13 +389,14 @@ class TunnelManager:
             pair = pair.strip()
             if ':' in pair:
                 remote, local = pair.split(':')
-                r_flags.extend(['-R', f'{remote.strip()}:localhost:{local.strip()}'])
+                r_flags.extend(['-R', f'{remote.strip()}:127.0.0.1:{local.strip()}'])
         
         # SSH command with connection options
-        base_cmd = ['ssh', 
+        base_cmd = ['ssh',
+                   '-vvv',
+                   '-o', 'ExitOnForwardFailure=yes', 
                    '-o', 'StrictHostKeyChecking=no', 
                    '-o', 'UserKnownHostsFile=NUL',
-                   '-o', 'BatchMode=yes',
                    '-o', 'ConnectTimeout=10',
                    '-o', 'ServerAliveInterval=60',
                    '-o', 'ServerAliveCountMax=3'] + r_flags + ['-N', f'{user}@{ip}']
@@ -811,21 +445,15 @@ class TunnelManager:
         creation_flags = 0
         if os.name == 'nt':
             creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-        
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags
-        )
+
+        # Start process with logging of stdout/stderr (-vvv output)
+        self.process = self._popen_with_logging(cmd, creation_flags)
         
         # Give it a moment to start and check if it failed immediately
         time.sleep(2)
         
         if self.process.poll() is not None:
-            stdout, stderr = self.process.communicate()
-            error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
-            raise ValueError(f"SSH failed to start: {error_msg}")
+            raise ValueError("SSH failed to start: process exited immediately")
         
         if not self.headless:
             self.status_label.config(text="Status: Running")
@@ -864,53 +492,17 @@ class TunnelManager:
         if not force_refresh and (current_time - self._last_scan_time) < self._cache_ttl:
             return self._tunnel_cache
         
-        # Perform fresh scan
-        self._tunnel_cache.clear()
+        # Perform fresh scan via process_utils
         try:
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
-                try:
-                    if proc.name().lower() in ['ssh.exe', 'ssh'] and proc.cmdline():
-                        cmdline = ' '.join(proc.cmdline())
-                        if '-R' in cmdline and '@' in cmdline:
-                            self._tunnel_cache[proc.pid] = {
-                                'pid': proc.pid,
-                                'cmdline': cmdline,
-                                'create_time': proc.create_time(),
-                                'user_host': self.extract_user_host(cmdline),
-                                'ports': self.extract_port_mappings(cmdline)
-                            }
-                except (psutil.NoSuchProcess, psutil.AccessDenied, IndexError):
-                    continue
+            scanned = pu.scan_ssh_tunnels()
+            # ensure dict[int, dict]
+            self._tunnel_cache = dict(scanned)
         except Exception as e:
             logging.error(f"Error scanning SSH processes: {e}")
-        
+            self._tunnel_cache = {}
+
         self._last_scan_time = current_time
         return self._tunnel_cache
-    
-    def schedule_updates(self):
-        """Initialize UI with current data - no automatic updates"""
-        if self.headless:
-            return
-        
-        # Only update status bar on startup - no process scanning
-        # User must manually refresh tunnel list and logs
-        pass
-    
-    def on_window_focus(self, event=None):
-        """Handle window gaining focus - NO automatic refresh to avoid performance issues"""
-        self._window_visible = True
-        # DO NOT auto-refresh on focus - this was causing performance issues
-        # User can manually refresh using the refresh button
-    
-    def on_window_unfocus(self, event=None):
-        """Handle window losing focus"""
-        self._window_visible = False
-    
-    def on_tab_changed(self, event=None):
-        """Handle tab change - NO automatic refresh to avoid performance issues"""
-        # DO NOT auto-refresh on tab change - this was causing constant process scanning
-        # User can manually refresh using the refresh button
-        pass
     
     # Tunnel Management Methods
     def add_tunnel_dialog(self):
@@ -986,235 +578,18 @@ class TunnelManager:
             return
         
         if tunnel_name in self._saved_tunnels:
-            if messagebox.askyesno("Confirm Delete", f"Delete tunnel configuration '{tunnel_name}'?"):
-                try:
-                    self.delete_tunnel_config(tunnel_name)
-                    messagebox.showinfo("Success", f"Tunnel '{tunnel_name}' deleted successfully.")
-                    self.refresh_tunnels()
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to delete tunnel: {e}")
+            try:
+                self.delete_tunnel_config(tunnel_name)
+                messagebox.showinfo("Success", f"Tunnel '{tunnel_name}' deleted successfully.")
+                self.refresh_tunnels()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete tunnel: {e}")
         else:
             messagebox.showwarning("Cannot Delete", "This is a running process, not a saved configuration.")
     
     def tunnel_config_dialog(self, existing_config=None, prefill=None):
-        """Open dialog to add/edit tunnel configuration"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Add Tunnel" if not existing_config else "Edit Tunnel")
-        dialog.geometry("700x600")
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        # Center the dialog
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
-        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
-        dialog.geometry(f"+{x}+{y}")
-        
-        # Main frame
-        main_frame = ttk.Frame(dialog, padding=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Title
-        title_text = "Add New Tunnel" if not existing_config else "Edit Tunnel Configuration"
-        ttk.Label(main_frame, text=title_text, style='Title.TLabel').pack(pady=(0, 20))
-        
-        # Form fields
-        fields_frame = ttk.Frame(main_frame)
-        fields_frame.pack(fill=tk.X, pady=(0, 20))
-        
-        # Tunnel Name
-        ttk.Label(fields_frame, text="Tunnel Name:", style='Heading.TLabel').pack(anchor=tk.W)
-        name_entry = ttk.Entry(fields_frame, font=('Segoe UI', 10), width=50)
-        name_entry.pack(fill=tk.X, pady=(5, 10))
-        
-        # Username
-        ttk.Label(fields_frame, text="Username:", style='Heading.TLabel').pack(anchor=tk.W)
-        user_entry = ttk.Entry(fields_frame, font=('Segoe UI', 10), width=50)
-        user_entry.pack(fill=tk.X, pady=(5, 10))
-        
-        # Host/IP
-        ttk.Label(fields_frame, text="Host/IP Address:", style='Heading.TLabel').pack(anchor=tk.W)
-        host_entry = ttk.Entry(fields_frame, font=('Segoe UI', 10), width=50)
-        host_entry.pack(fill=tk.X, pady=(5, 10))
-        
-        # Ports
-        ttk.Label(fields_frame, text="Port Mappings (remote:local, comma-separated):", style='Heading.TLabel').pack(anchor=tk.W)
-        ports_entry = ttk.Entry(fields_frame, font=('Segoe UI', 10), width=50)
-        ports_entry.pack(fill=tk.X, pady=(5, 10))
-        
-        # Authentication method
-        ttk.Label(fields_frame, text="Authentication Method:", style='Heading.TLabel').pack(anchor=tk.W)
-        auth_frame = ttk.Frame(fields_frame)
-        auth_frame.pack(fill=tk.X, pady=(5, 10))
-        
-        auth_var = tk.StringVar(value="key")
-        ttk.Radiobutton(auth_frame, text="SSH Key (default)", variable=auth_var, value="key").pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(auth_frame, text="Username/Password", variable=auth_var, value="password").pack(side=tk.LEFT)
-        
-        # Password field (initially hidden)
-        password_frame = ttk.Frame(fields_frame)
-        password_frame.pack(fill=tk.X, pady=(5, 10))
-        
-        password_label = ttk.Label(password_frame, text="Password:", style='Heading.TLabel')
-        password_entry = ttk.Entry(password_frame, font=('Segoe UI', 10), width=50, show="*")
-        
-        def toggle_password_field():
-            if auth_var.get() == "password":
-                password_label.pack(anchor=tk.W)
-                password_entry.pack(fill=tk.X, pady=(5, 0))
-            else:
-                password_label.pack_forget()
-                password_entry.pack_forget()
-        
-        # Bind radio button changes
-        auth_frame.winfo_children()[0].configure(command=toggle_password_field)
-        auth_frame.winfo_children()[1].configure(command=toggle_password_field)
-        
-        # Description
-        ttk.Label(fields_frame, text="Description (optional):", style='Heading.TLabel').pack(anchor=tk.W)
-        desc_entry = ttk.Entry(fields_frame, font=('Segoe UI', 10), width=50)
-        desc_entry.pack(fill=tk.X, pady=(5, 10))
-        
-        # Fill existing data if editing
-        if existing_config:
-            name_entry.insert(0, existing_config['name'])
-            user_entry.insert(0, existing_config['user'])
-            host_entry.insert(0, existing_config['host'])
-            ports_entry.insert(0, existing_config['ports'])
-            desc_entry.insert(0, existing_config.get('description', ''))
-            
-            # Set authentication method
-            auth_method = existing_config.get('auth_method', 'key')
-            auth_var.set(auth_method)
-            
-            # Set password if using password auth
-            if auth_method == 'password' and 'password' in existing_config:
-                password_entry.insert(0, existing_config['password'])
-            
-            # Show/hide password field based on auth method
-            toggle_password_field()
-            
-            name_entry.config(state='readonly')  # Don't allow name changes when editing
-        else:
-            # Apply prefill if provided when adding a new tunnel
-            if prefill:
-                if prefill.get('user'):
-                    user_entry.insert(0, prefill['user'])
-                if prefill.get('host'):
-                    host_entry.insert(0, prefill['host'])
-        
-        # Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, pady=10)
-        
-        def save_tunnel():
-            name = name_entry.get().strip()
-            user = user_entry.get().strip()
-            host = host_entry.get().strip()
-            ports = ports_entry.get().strip()
-            description = desc_entry.get().strip()
-            auth_method = auth_var.get()
-            password = password_entry.get().strip() if auth_method == "password" else ""
-            
-            # Validate required fields
-            required_fields = [name, user, host, ports]
-            if auth_method == "password":
-                required_fields.append(password)
-            
-            if not all(required_fields):
-                missing = "Please fill in all required fields."
-                if auth_method == "password" and not password:
-                    missing += " Password is required when using password authentication."
-                messagebox.showerror("Validation Error", missing)
-                return
-            
-            # Validate name uniqueness (only for new tunnels)
-            if not existing_config and name in self._saved_tunnels:
-                messagebox.showerror("Name Exists", "A tunnel with this name already exists.")
-                return
-            
-            # Validate port format
-            try:
-                for pair in ports.split(','):
-                    pair = pair.strip()
-                    if ':' not in pair:
-                        raise ValueError("Invalid port format")
-                    remote, local = pair.split(':')
-                    int(remote.strip())
-                    int(local.strip())
-            except ValueError:
-                messagebox.showerror("Invalid Ports", "Port mappings must be in format 'remote:local' (e.g., '8080:80,9000:9000')")
-                return
-            
-            tunnel_config = {
-                'name': name,
-                'user': user,
-                'host': host,
-                'ports': ports,
-                'description': description,
-                'auth_method': auth_method,
-                'password': password if auth_method == 'password' else ''
-            }
-            
-            try:
-                self.save_tunnel_config(tunnel_config)
-                action = "updated" if existing_config else "added"
-                messagebox.showinfo("Success", f"Tunnel '{name}' {action} successfully!")
-                dialog.destroy()
-                self.refresh_tunnels()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save tunnel: {e}")
-        
-        def test_connection():
-            user = user_entry.get().strip()
-            host = host_entry.get().strip()
-            auth_method = auth_var.get()
-            password = password_entry.get().strip() if auth_method == "password" else ""
-            
-            if not user or not host:
-                messagebox.showerror("Missing Info", "Please enter username and host first.")
-                return
-            
-            if auth_method == "password" and not password:
-                messagebox.showerror("Missing Password", "Please enter password for password authentication.")
-                return
-            
-            try:
-                if auth_method == "password":
-                    # Test password authentication
-                    try:
-                        # Try sshpass first
-                        subprocess.run(['sshpass', '-V'], capture_output=True, check=True)
-                        test_cmd = ['sshpass', '-p', password, 'ssh', '-o', 'ConnectTimeout=5', 
-                                   '-o', 'StrictHostKeyChecking=no', '-o', 'PreferredAuthentications=password',
-                                   '-o', 'PubkeyAuthentication=no', f'{user}@{host}', 'echo', 'Connection test successful']
-                    except (FileNotFoundError, subprocess.CalledProcessError):
-                        messagebox.showwarning("Limited Testing", 
-                                             "Password connection testing requires 'sshpass'.\n"
-                                             "The tunnel may still work, but testing is limited.")
-                        return
-                else:
-                    # Test SSH key authentication
-                    test_cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 
-                               '-o', 'StrictHostKeyChecking=no', f'{user}@{host}', 'echo', 'Connection test successful']
-                
-                result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15)
-                
-                if result.returncode == 0:
-                    messagebox.showinfo("Test Success", "SSH connection successful!")
-                else:
-                    error_msg = result.stderr[:300] if result.stderr else "Unknown error"
-                    messagebox.showerror("Test Failed", f"Connection failed:\n{error_msg}...")
-            except Exception as e:
-                messagebox.showerror("Test Error", f"Connection test failed: {e}")
-        
-        # Button layout - fix ordering
-        ttk.Button(button_frame, text="Test Connection", command=test_connection).pack(side=tk.LEFT, padx=5)
-        
-        # Right side buttons (pack in reverse order since they're on the right)
-        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(button_frame, text="Save", command=save_tunnel, style='Primary.TButton').pack(side=tk.RIGHT, padx=5)
+        """Open dialog to add/edit tunnel configuration (delegates to tunnel_ui)."""
+        return tunnel_ui.tunnel_config_dialog(self, existing_config, prefill)
     
     def start_saved_tunnel(self, tunnel_name):
         """Start a saved tunnel configuration"""
@@ -1231,7 +606,7 @@ class TunnelManager:
                 pair = pair.strip()
                 if ':' in pair:
                     remote, local = pair.split(':')
-                    r_flags.extend(['-R', f'{remote.strip()}:localhost:{local.strip()}'])
+                    r_flags.extend(['-R', f'{remote.strip()}:127.0.0.1:{local.strip()}'])
             
             # Build SSH command based on authentication method
             auth_method = config.get('auth_method', 'key')
@@ -1239,7 +614,9 @@ class TunnelManager:
             if auth_method == 'password':
                 # For password authentication, we need to use sshpass or expect
                 # Check if sshpass is available, otherwise use expect-like approach
-                cmd = ['ssh', 
+                cmd = ['ssh',
+                       '-vvv',
+                       '-o', 'ExitOnForwardFailure=yes', 
                        '-o', 'StrictHostKeyChecking=no', 
                        '-o', 'UserKnownHostsFile=NUL',
                        '-o', 'ConnectTimeout=10',
@@ -1249,10 +626,12 @@ class TunnelManager:
                        '-o', 'PubkeyAuthentication=no'] + r_flags + ['-N', f"{config['user']}@{config['host']}"]
             else:
                 # SSH key authentication (default)
-                cmd = ['ssh', 
+                cmd = ['ssh',
+                       '-vvv',
+                       '-o', 'ExitOnForwardFailure=yes', 
                        '-o', 'StrictHostKeyChecking=no', 
                        '-o', 'UserKnownHostsFile=NUL',
-                       '-o', 'BatchMode=yes',
+                       '-o', 'PreferredAuthentications=publickey',
                        '-o', 'ConnectTimeout=10',
                        '-o', 'ServerAliveInterval=60',
                        '-o', 'ServerAliveCountMax=3'] + r_flags + ['-N', f"{config['user']}@{config['host']}"]
@@ -1273,12 +652,7 @@ class TunnelManager:
                     # Check if sshpass is available
                     subprocess.run(['sshpass', '-V'], capture_output=True, check=True)
                     sshpass_cmd = ['sshpass', '-p', password] + cmd
-                    process = subprocess.Popen(
-                        sshpass_cmd,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=creation_flags
-                    )
+                    process = self._popen_with_logging(sshpass_cmd, creation_flags)
                 except (FileNotFoundError, subprocess.CalledProcessError):
                     # sshpass not available, create a simple expect-like solution
                     # For Windows, we'll use a different approach
@@ -1290,12 +664,7 @@ class TunnelManager:
                             f.write(f'echo {password} | {" ".join(cmd)}\n')
                             batch_file = f.name
                         
-                        process = subprocess.Popen(
-                            ['cmd', '/c', batch_file],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=creation_flags
-                        )
+                        process = self._popen_with_logging(['cmd', '/c', batch_file], creation_flags)
                         
                         # Clean up batch file after a delay
                         def cleanup_batch():
@@ -1328,29 +697,16 @@ class TunnelManager:
                                 "Please install sshpass for better password support, or use SSH keys."
                             )
                             # Try basic approach anyway
-                            process = subprocess.Popen(
-                                cmd,
-                                stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                creationflags=creation_flags
-                            )
+                            process = self._popen_with_logging(cmd, creation_flags)
             else:
                 # SSH key authentication
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=creation_flags
-                )
+                process = self._popen_with_logging(cmd, creation_flags)
             
             # Give it a moment to start
             time.sleep(2)
             
             if process.poll() is not None:
-                stdout, stderr = process.communicate()
-                error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
-                raise ValueError(f"SSH failed to start: {error_msg}")
+                raise ValueError("SSH failed to start: process exited immediately")
             
             # Track the tunnel
             self._active_tunnels[tunnel_name] = {
@@ -1371,6 +727,40 @@ class TunnelManager:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to start tunnel '{tunnel_name}': {e}")
             logging.error(f"Failed to start tunnel '{tunnel_name}': {e}")
+
+    def _popen_with_logging(self, cmd, creation_flags=0):
+        """Start a subprocess with pipes and stream its output to the logger."""
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,  # prevent ssh from trying to read prompts
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=creation_flags
+            )
+        except Exception as e:
+            logging.error(f"Failed to launch process: {e}")
+            raise
+
+        # Start reader threads
+        threading.Thread(target=self._log_stream, args=(proc.stderr, logging.INFO, "[SSH] "), daemon=True).start()
+        threading.Thread(target=self._log_stream, args=(proc.stdout, logging.DEBUG, "[SSH-OUT] "), daemon=True).start()
+        return proc
+
+    def _log_stream(self, stream, level, prefix=""):
+        """Continuously read a stream and log each line."""
+        try:
+            for line in iter(stream.readline, ''):
+                if line:
+                    logging.log(level, f"{prefix}{line.rstrip()}")
+        except Exception as e:
+            logging.debug(f"Stream logger ended: {e}")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
     
     def quick_start_tunnel(self):
         """Create and start a tunnel from Connection tab settings"""
@@ -1416,28 +806,8 @@ class TunnelManager:
     def find_external_tunnels(self):
         """Find and display external SSH tunnel processes for management"""
         try:
-            # Force a fresh scan to find all SSH processes
-            external_processes = []
-            
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
-                try:
-                    if proc.name().lower() in ['ssh.exe', 'ssh'] and proc.cmdline():
-                        cmdline = ' '.join(proc.cmdline())
-                        if '-R' in cmdline and '@' in cmdline:
-                            # This is an SSH reverse tunnel
-                            user_host = self.extract_user_host(cmdline)
-                            ports = self.extract_port_mappings(cmdline)
-                            duration = self.format_duration(time.time() - proc.create_time())
-                            
-                            external_processes.append({
-                                'pid': proc.pid,
-                                'user_host': user_host,
-                                'ports': ports,
-                                'duration': duration,
-                                'cmdline': cmdline
-                            })
-                except (psutil.NoSuchProcess, psutil.AccessDenied, IndexError):
-                    continue
+            # Use process_utils to build the list
+            external_processes = pu.list_external_tunnels()
             
             if not external_processes:
                 messagebox.showinfo("No External Tunnels", "No external SSH tunnel processes found.")
@@ -1451,121 +821,8 @@ class TunnelManager:
             logging.error(f"Error finding external tunnels: {e}")
     
     def show_external_tunnels_dialog(self, processes):
-        """Show dialog with external SSH processes for management"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("External SSH Tunnels Found")
-        dialog.geometry("700x400")
-        dialog.resizable(True, True)
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        # Center the dialog
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
-        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
-        dialog.geometry(f"+{x}+{y}")
-        
-        # Main frame
-        main_frame = ttk.Frame(dialog, padding=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Title
-        ttk.Label(main_frame, text="External SSH Tunnel Processes", style='Title.TLabel').pack(pady=(0, 20))
-        
-        # Info
-        info_text = "These SSH tunnel processes are running but not managed by this app.\nYou can stop them or manage them here."
-        ttk.Label(main_frame, text=info_text, font=('Segoe UI', 9)).pack(pady=(0, 15))
-        
-        # Process list
-        list_frame = ttk.Frame(main_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
-        
-        columns = ('PID', 'Connection', 'Ports', 'Uptime')
-        tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=8)
-        
-        # Configure columns
-        tree.heading('PID', text='Process ID')
-        tree.heading('Connection', text='Connection')
-        tree.heading('Ports', text='Port Mappings')
-        tree.heading('Uptime', text='Uptime')
-        
-        tree.column('PID', width=80, anchor=tk.CENTER)
-        tree.column('Connection', width=200)
-        tree.column('Ports', width=150)
-        tree.column('Uptime', width=100, anchor=tk.CENTER)
-        
-        # Add processes to tree
-        for proc in processes:
-            tree.insert('', 'end', values=(
-                proc['pid'], proc['user_host'], proc['ports'], proc['duration']
-            ))
-        
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
-        
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, pady=10)
-        
-        def stop_selected():
-            selection = tree.selection()
-            if not selection:
-                messagebox.showwarning("No Selection", "Please select a process to stop.")
-                return
-            
-            item = selection[0]
-            values = tree.item(item, 'values')
-            pid = int(values[0])
-            connection = values[1]
-            
-            if messagebox.askyesno("Confirm Stop", f"Stop SSH process {connection} (PID: {pid})?"):
-                try:
-                    proc = psutil.Process(pid)
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                    messagebox.showinfo("Success", f"Process {pid} stopped successfully.")
-                    tree.delete(item)
-                    logging.info(f"Stopped external SSH process PID: {pid}")
-                except psutil.TimeoutExpired:
-                    proc.kill()
-                    messagebox.showinfo("Success", f"Process {pid} force-killed.")
-                    tree.delete(item)
-                except psutil.NoSuchProcess:
-                    messagebox.showwarning("Process Gone", "Process no longer exists.")
-                    tree.delete(item)
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to stop process: {e}")
-        
-        def stop_all():
-            if messagebox.askyesno("Confirm Stop All", "Stop ALL external SSH tunnel processes?"):
-                stopped_count = 0
-                for proc in processes:
-                    try:
-                        p = psutil.Process(proc['pid'])
-                        p.terminate()
-                        p.wait(timeout=3)
-                        stopped_count += 1
-                    except:
-                        try:
-                            p.kill()
-                            stopped_count += 1
-                        except:
-                            pass
-                
-                messagebox.showinfo("Success", f"Stopped {stopped_count} processes.")
-                dialog.destroy()
-                self.refresh_tunnels()
-        
-        # Button layout
-        ttk.Button(button_frame, text="🛑 Stop Selected", command=stop_selected, 
-                  style='Danger.TButton').pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="⏹️ Stop All", command=stop_all, 
-                  style='Danger.TButton').pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
+        """Show dialog with external SSH processes for management (delegates to tunnel_ui)."""
+        return tunnel_ui.show_external_tunnels_dialog(self, processes)
     
     def stop_tunnel(self):
         """Stop tunnel from GUI"""
@@ -1717,30 +974,8 @@ class TunnelManager:
             messagebox.showerror("Error", f"Could not open log file: {e}")
     
     def update_log_display(self):
-        """Update the log display in GUI"""
-        if self.headless or not hasattr(self, 'log_text'):
-            return
-        
-        try:
-            if os.path.exists(LOG_FILE):
-                # Only read if log tab is visible or window is focused
-                current_tab = self.notebook.tab(self.notebook.select(), "text")
-                if "Activity Log" not in current_tab and not self._window_visible:
-                    # Skip update if log tab not visible and window not focused
-                    pass
-                else:
-                    with open(LOG_FILE, 'r') as f:
-                        lines = f.readlines()
-                        # Show last 50 lines (increased from 20 for better context)
-                        recent_lines = lines[-50:] if len(lines) > 50 else lines
-                        
-                    self.log_text.delete(1.0, tk.END)
-                    self.log_text.insert(tk.END, ''.join(recent_lines))
-                    self.log_text.see(tk.END)
-        except Exception as e:
-            logging.error(f"Error updating log display: {e}")
-        
-        # No automatic scheduling - updates are manual only
+        """Update the log display in GUI (delegates to tunnel_ui)."""
+        return tunnel_ui.update_log_display(self)
     
     # System tray methods
     def minimize_to_tray(self):
@@ -1764,7 +999,11 @@ class TunnelManager:
     
     def on_closing(self):
         """Handle window close event"""
-        # Check if minimize to tray is enabled (if the variable exists)
+        # If launched from a console, exiting should release the terminal
+        if getattr(self, '_launched_from_console', False):
+            self.quit_app()
+            return
+        # Otherwise, check minimize-to-tray preference
         if hasattr(self, 'minimize_to_tray_var') and self.minimize_to_tray_var.get():
             self.minimize_to_tray()
         else:
@@ -1852,8 +1091,13 @@ class TunnelManager:
         except Exception as e:
             logging.error(f"Error during shutdown: {e}")
         finally:
-            # Return to caller; allow normal interpreter shutdown
-            return
+            # Ensure process terminates so calling terminal is released
+            try:
+                sys.exit(0)
+            except SystemExit:
+                pass
+            # Fallback hard-exit if something is still blocking (e.g., orphaned threads)
+            os._exit(0)
     
     # Enhanced UI Methods
     def update_tunnel_list(self):
@@ -1940,40 +1184,22 @@ class TunnelManager:
     def extract_user_host(self, cmdline):
         """Extract user@host from SSH command line"""
         try:
-            parts = cmdline.split()
-            for part in parts:
-                if '@' in part and not part.startswith('-'):
-                    return part
-            return "Unknown"
+            return pu.extract_user_host(cmdline)
         except:
             return "Unknown"
     
     def extract_port_mappings(self, cmdline):
         """Extract port mappings from SSH command line"""
         try:
-            parts = cmdline.split()
-            mappings = []
-            for i, part in enumerate(parts):
-                if part == '-R' and i + 1 < len(parts):
-                    mapping = parts[i + 1]
-                    if ':' in mapping:
-                        mappings.append(mapping)
-            return ', '.join(mappings) if mappings else "Unknown"
+            return pu.extract_port_mappings(cmdline)
         except:
             return "Unknown"
     
     def format_duration(self, seconds):
         """Format duration in human readable format"""
         try:
-            if seconds < 60:
-                return f"{int(seconds)}s"
-            elif seconds < 3600:
-                return f"{int(seconds//60)}m {int(seconds%60)}s"
-            else:
-                hours = int(seconds // 3600)
-                minutes = int((seconds % 3600) // 60)
-                return f"{hours}h {minutes}m"
-        except:
+            return pu.format_duration(int(seconds))
+        except Exception:
             return "Unknown"
     
     def refresh_tunnels(self):
@@ -2011,42 +1237,34 @@ class TunnelManager:
                 messagebox.showerror("Error", "Invalid process ID.")
                 return
             
-            # Confirm action
-            if messagebox.askyesno("Confirm Stop", f"Stop tunnel '{tunnel_name}' ({connection}, PID: {pid})?"):
-                try:
-                    proc = psutil.Process(pid)
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                    
-                    # Clear PID from config and active tunnels
-                    self.clear_tunnel_pid(tunnel_name)
-                    if tunnel_name in self._active_tunnels:
-                        del self._active_tunnels[tunnel_name]
-                    
-                    messagebox.showinfo("Success", f"Tunnel '{tunnel_name}' stopped successfully.")
-                    logging.info(f"Stopped tunnel '{tunnel_name}' (PID: {pid})")
-                    self.refresh_tunnels()
-                    
-                except psutil.TimeoutExpired:
-                    proc.kill()
-                    
-                    # Clear PID from config and active tunnels
-                    self.clear_tunnel_pid(tunnel_name)
-                    if tunnel_name in self._active_tunnels:
-                        del self._active_tunnels[tunnel_name]
-                    
-                    messagebox.showinfo("Success", f"Tunnel '{tunnel_name}' force-killed.")
-                    logging.info(f"Force-killed tunnel '{tunnel_name}' (PID: {pid})")
-                    self.refresh_tunnels()
-                    
-                except psutil.NoSuchProcess:
-                    # Process already gone, just clear the PID
-                    self.clear_tunnel_pid(tunnel_name)
-                    if tunnel_name in self._active_tunnels:
-                        del self._active_tunnels[tunnel_name]
-                    
-                    messagebox.showwarning("Process Not Found", "The selected process no longer exists.")
-                    self.refresh_tunnels()
+            # Execute stop without confirmation
+            try:
+                proc = psutil.Process(pid)
+                proc.terminate()
+                proc.wait(timeout=5)
+                
+                # Clear PID from config and active tunnels
+                self.clear_tunnel_pid(tunnel_name)
+                if tunnel_name in self._active_tunnels:
+                    del self._active_tunnels[tunnel_name]
+                
+                messagebox.showinfo("Success", f"Tunnel '{tunnel_name}' stopped successfully.")
+                logging.info(f"Stopped tunnel '{tunnel_name}' (PID: {pid})")
+                self.refresh_tunnels()
+                
+            except psutil.TimeoutExpired:
+                proc.kill()
+                
+                # Clear PID from config and active tunnels
+                self.clear_tunnel_pid(tunnel_name)
+                if tunnel_name in self._active_tunnels:
+                    del self._active_tunnels[tunnel_name]
+                
+                messagebox.showinfo("Forced Stop", f"Tunnel '{tunnel_name}' was forcefully terminated.")
+                logging.info(f"Force killed tunnel '{tunnel_name}' (PID: {pid})")
+                self.refresh_tunnels()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to stop tunnel: {e}")
                     
         except Exception as e:
             messagebox.showerror("Error", f"Failed to stop tunnel: {e}")
@@ -2061,95 +1279,27 @@ class TunnelManager:
             return self.tunnel_tree.item(item_id, 'text')
         except Exception:
             return ""
-    
+
     def stop_all_tunnels(self):
         """Stop all running tunnels"""
         try:
-            # Use cached processes and force refresh after stopping
-            ssh_processes = self._get_cached_ssh_processes(force_refresh=True)
-            tunnel_count = len(ssh_processes)
-            stopped_count = 0
-            
-            for proc_info in ssh_processes.values():
-                try:
-                    proc = psutil.Process(proc_info['pid'])
-                    proc.terminate()
-                    proc.wait(timeout=3)
-                    stopped_count += 1
-                except psutil.TimeoutExpired:
-                    try:
-                        proc.kill()
-                        stopped_count += 1
-                    except psutil.NoSuchProcess:
-                        pass
-                except psutil.NoSuchProcess:
-                    pass
-            
-            if tunnel_count == 0:
-                messagebox.showinfo("No Tunnels", "No active tunnels found.")
-            else:
-                messagebox.showinfo("Success", f"Stopped {stopped_count} of {tunnel_count} tunnels.")
-                logging.info(f"Stopped {stopped_count} of {tunnel_count} tunnels")
-            
-            # Force cache refresh after stopping
+            count = pu.stop_all_ssh_tunnels(timeout=3.0)
+            # refresh cache
             self._get_cached_ssh_processes(force_refresh=True)
-            self.refresh_tunnels()
-            
+            if not self.headless:
+                if count > 0:
+                    messagebox.showinfo("Success", "All SSH tunnels have been stopped.")
+                else:
+                    messagebox.showinfo("No Tunnels", "No SSH tunnels were running.")
+        except Exception:
+            return ""
         except Exception as e:
             messagebox.showerror("Error", f"Failed to stop tunnels: {e}")
             logging.error(f"Error stopping all tunnels: {e}")
     
     def view_tunnel_details(self):
-        """Show detailed information about the selected tunnel"""
-        try:
-            selection = self.tunnel_tree.selection()
-            if not selection:
-                messagebox.showwarning("No Selection", "Please select a tunnel to view details.")
-                return
-            
-            item = selection[0]
-            values = self.tunnel_tree.item(item, 'values')
-            # If a parent (connection) node is selected, do nothing
-            if not values:
-                messagebox.showwarning("Invalid Selection", "Select a specific tunnel under a connection.")
-                return
-            tunnel_name = values[0]
-            connection = self.get_connection_for_item(item)
-            ports = values[1]
-            status = values[3]
-            duration = values[5]
-            pid_str = values[4]
-            if pid_str == "-":
-                messagebox.showinfo("Tunnel Details", f"Tunnel Details:\n\nName: {tunnel_name}\nConnection: {connection}\nPort Mappings: {ports}\nStatus: {status}\nUptime: {duration}\n\nNo process is currently associated with this tunnel.")
-                return
-            pid = int(pid_str)
-            
-            try:
-                proc = psutil.Process(pid)
-                info = f"""Tunnel Details:
-
-Name: {tunnel_name}
-Process ID: {pid}
-Connection: {connection}
-Port Mappings: {ports}
-Status: {status}
-Uptime: {duration}
-
-Process Info:
-Executable: {proc.exe()}
-Command Line: {' '.join(proc.cmdline())}
-CPU Usage: {proc.cpu_percent():.1f}%
-Memory Usage: {proc.memory_info().rss / 1024 / 1024:.1f} MB
-Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M:%S')}
-"""
-                messagebox.showinfo("Tunnel Details", info)
-                
-            except psutil.NoSuchProcess:
-                messagebox.showerror("Error", "The selected process no longer exists.")
-                self.refresh_tunnels()
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to get tunnel details: {e}")
+        """Show detailed information about the selected tunnel (delegates to tunnel_ui)."""
+        return tunnel_ui.view_tunnel_details(self)
     
     def restart_selected_tunnel(self):
         """Restart the selected tunnel"""
@@ -2199,15 +1349,8 @@ Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M
             logging.error(f"Error restarting selected tunnel: {e}")
     
     def show_tunnel_context_menu(self, event):
-        """Show context menu for tunnel list"""
-        try:
-            # Select the item under cursor
-            item = self.tunnel_tree.identify_row(event.y)
-            if item:
-                self.tunnel_tree.selection_set(item)
-                self.tunnel_context_menu.post(event.x_root, event.y_root)
-        except Exception as e:
-            logging.error(f"Error showing context menu: {e}")
+        """Show context menu for tunnel list (delegates to tunnel_ui)."""
+        return tunnel_ui.show_tunnel_context_menu(self, event)
 
     def get_connection_for_item(self, item_id):
         """Return the connection label (user@host) for a given tree item.
@@ -2292,85 +1435,12 @@ Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M
             messagebox.showerror("Error", f"Failed to restart all tunnels: {e}")
     
     def copy_tunnel_command(self):
-        """Copy the SSH command of selected tunnel to clipboard"""
-        try:
-            selection = self.tunnel_tree.selection()
-            if not selection:
-                messagebox.showwarning("No Selection", "Please select a tunnel to copy command.")
-                return
-            
-            item = selection[0]
-            values = self.tunnel_tree.item(item, 'values')
-            if not values:
-                messagebox.showwarning("Invalid Selection", "Select a specific tunnel under a connection.")
-                return
-            tunnel_name = values[0]
-            pid_str = values[4]
-            
-            try:
-                cmdline = None
-                if pid_str and pid_str != "-":
-                    proc = psutil.Process(int(pid_str))
-                    cmdline = ' '.join(proc.cmdline())
-                else:
-                    # Build command from saved configuration
-                    if tunnel_name not in self._saved_tunnels:
-                        messagebox.showwarning("Not Managed", "This tunnel is not a saved configuration.")
-                        return
-                    config = self._saved_tunnels[tunnel_name]
-                    r_flags = []
-                    for pair in config['ports'].split(','):
-                        pair = pair.strip()
-                        if ':' in pair:
-                            remote, local = pair.split(':')
-                            r_flags.extend(['-R', f'{remote.strip()}:localhost:{local.strip()}'])
-                    base = [
-                        'ssh',
-                        '-o', 'StrictHostKeyChecking=no',
-                        '-o', 'UserKnownHostsFile=NUL',
-                        '-o', 'BatchMode=yes',
-                        '-o', 'ConnectTimeout=10',
-                        '-o', 'ServerAliveInterval=60',
-                        '-o', 'ServerAliveCountMax=3'
-                    ] + r_flags + ['-N', f"{config['user']}@{config['host']}"]
-                    cmdline = ' '.join(base)
-                
-                # Copy to clipboard
-                self.root.clipboard_clear()
-                self.root.clipboard_append(cmdline)
-                self.root.update()
-                
-                messagebox.showinfo("Success", "SSH command copied to clipboard.")
-                
-            except psutil.NoSuchProcess:
-                messagebox.showerror("Error", "The selected process no longer exists.")
-                self.refresh_tunnels()
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to copy command: {e}")
+        """Copy the SSH command of selected tunnel to clipboard (delegates to tunnel_ui)."""
+        return tunnel_ui.copy_tunnel_command(self)
     
     def update_status_bar(self):
-        """Update the bottom status bar"""
-        if self.headless or not hasattr(self, 'status_bar_text'):
-            return
-        
-        try:
-            # Update connection indicator
-            if self.is_tunnel_running():
-                self.connection_indicator.config(foreground='green')
-                self.status_bar_text.config(text="Connected")
-                self.status_label.config(text="● Running", foreground=self.colors['success'])
-                self.status_detail.config(text="SSH tunnel is active")
-            else:
-                self.connection_indicator.config(foreground='red')
-                self.status_bar_text.config(text="Disconnected")
-                self.status_label.config(text="● Idle", foreground=self.colors['warning'])
-                self.status_detail.config(text="No active connections")
-        
-        except Exception as e:
-            logging.error(f"Error updating status bar: {e}")
-        
-        # No automatic scheduling - updates are manual only
+        """Update the bottom status bar (delegates to tunnel_ui)."""
+        return tunnel_ui.update_status_bar(self)
     
     def open_config_file(self):
         """Open the configuration file in default editor"""
@@ -2385,30 +1455,29 @@ Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M
     def clear_logs(self):
         """Clear the log file and display"""
         try:
-            if messagebox.askyesno("Confirm Clear", "Clear all log entries?"):
-                # Temporarily close file logging to release file handle
-                close_file_logging()
+            # Temporarily close file logging to release file handle
+            close_file_logging()
+            
+            try:
+                # Clear log file
+                with open(LOG_FILE, 'w') as f:
+                    f.write("")
                 
-                try:
-                    # Clear log file
-                    with open(LOG_FILE, 'w') as f:
-                        f.write("")
-                    
-                    # Clear log display
-                    if hasattr(self, 'log_text'):
-                        self.log_text.delete(1.0, tk.END)
-                    
-                    # Reopen file logging
-                    setup_file_logging()
-                    
-                    logging.info("Log file cleared")
-                    messagebox.showinfo("Success", "Logs cleared successfully.")
-                    
-                except Exception as e:
-                    # Make sure to reopen logging even if clearing failed
-                    setup_file_logging()
-                    raise e
-                    
+                # Clear log display
+                if hasattr(self, 'log_text'):
+                    self.log_text.delete(1.0, tk.END)
+                
+                # Reopen file logging
+                setup_file_logging()
+                
+                logging.info("Log file cleared")
+                messagebox.showinfo("Success", "Logs cleared successfully.")
+                
+            except Exception as e:
+                # Make sure to reopen logging even if clearing failed
+                setup_file_logging()
+                raise e
+                
         except Exception as e:
             messagebox.showerror("Error", f"Failed to clear logs: {e}")
     
@@ -2480,138 +1549,54 @@ Start Time: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M
             logging.error(f"Error saving configuration: {e}")
     
     def load_saved_tunnels(self):
-        """Load saved tunnel configurations from config file"""
+        """Load saved tunnel configurations from config file (delegates to config_store)."""
         try:
-            self._saved_tunnels = {}
-            
-            # Load from config file
-            for section_name in self.config.sections():
-                if section_name.startswith('Tunnel_'):
-                    tunnel_name = section_name[7:]  # Remove 'Tunnel_' prefix
-                    section = self.config[section_name]
-                    
-                    tunnel_config = {
-                        'name': tunnel_name,
-                        'user': section.get('user', ''),
-                        'host': section.get('host', ''),
-                        'ports': section.get('ports', ''),
-                        'description': section.get('description', ''),
-                        'auth_method': section.get('auth_method', 'key'),
-                        'password': self._decrypt_password(section.get('password', '')) if section.get('password') else ''
-                    }
-                    
-                    self._saved_tunnels[tunnel_name] = tunnel_config
-            
-            logging.info(f"Loaded {len(self._saved_tunnels)} saved tunnel configurations")
-            
+            self._saved_tunnels = cs_load_saved_tunnels(self.config, CONFIG_FILE)
         except Exception as e:
             logging.error(f"Error loading saved tunnels: {e}")
             self._saved_tunnels = {}
     
     def save_tunnel_config(self, tunnel_config):
-        """Save a tunnel configuration to the config file"""
+        """Save a tunnel configuration to the config file (delegates to config_store)."""
         try:
-            tunnel_name = tunnel_config['name']
-            section_name = f'Tunnel_{tunnel_name}'
-            
-            # Remove existing section if it exists
-            if section_name in self.config:
-                self.config.remove_section(section_name)
-            
-            # Create new section
-            self.config.add_section(section_name)
-            section = self.config[section_name]
-            
-            # Save tunnel configuration
-            section['name'] = tunnel_config['name']
-            section['user'] = tunnel_config['user']
-            section['host'] = tunnel_config['host']
-            section['ports'] = tunnel_config['ports']
-            section['description'] = tunnel_config.get('description', '')
-            section['auth_method'] = tunnel_config.get('auth_method', 'key')
-            
-            # Encrypt and save password if using password authentication
-            if tunnel_config.get('auth_method') == 'password' and tunnel_config.get('password'):
-                section['password'] = self._encrypt_password(tunnel_config['password'])
-            
-            # Save to file
-            self.save_config()
-            
-            # Update in-memory storage
-            self._saved_tunnels[tunnel_name] = tunnel_config.copy()
-            
-            logging.info(f"Saved tunnel configuration: {tunnel_name}")
-            
+            cs_save_tunnel_config(self.config, CONFIG_FILE, tunnel_config)
+            # Keep in-memory cache in sync
+            self._saved_tunnels[tunnel_config['name']] = tunnel_config.copy()
         except Exception as e:
             logging.error(f"Error saving tunnel configuration: {e}")
             raise
     
     def delete_tunnel_config(self, tunnel_name):
-        """Delete a tunnel configuration"""
+        """Delete a tunnel configuration (delegates to config_store)."""
         try:
-            section_name = f'Tunnel_{tunnel_name}'
-            
-            # Remove from config file
-            if section_name in self.config:
-                self.config.remove_section(section_name)
-                self.save_config()
-            
-            # Remove from in-memory storage
+            cs_delete_tunnel_config(self.config, CONFIG_FILE, tunnel_name)
             if tunnel_name in self._saved_tunnels:
                 del self._saved_tunnels[tunnel_name]
-            
-            logging.info(f"Deleted tunnel configuration: {tunnel_name}")
-            
         except Exception as e:
             logging.error(f"Error deleting tunnel configuration: {e}")
             raise
     
     def save_tunnel_pid(self, tunnel_name, pid):
-        """Save the PID of a running tunnel for persistence"""
+        """Save the PID of a running tunnel for persistence (delegates to config_store)."""
         try:
-            section_name = f'Tunnel_{tunnel_name}'
-            if section_name in self.config:
-                self.config[section_name]['pid'] = str(pid)
-                self.save_config()
+            cs_save_tunnel_pid(self.config, CONFIG_FILE, tunnel_name, pid)
         except Exception as e:
             logging.error(f"Error saving tunnel PID: {e}")
     
     def clear_tunnel_pid(self, tunnel_name):
-        """Clear the saved PID for a tunnel"""
+        """Clear the saved PID for a tunnel (delegates to config_store)."""
         try:
-            section_name = f'Tunnel_{tunnel_name}'
-            if section_name in self.config and 'pid' in self.config[section_name]:
-                del self.config[section_name]['pid']
-                self.save_config()
+            cs_clear_tunnel_pid(self.config, CONFIG_FILE, tunnel_name)
         except Exception as e:
             logging.error(f"Error clearing tunnel PID: {e}")
     
     def _encrypt_password(self, password):
-        """Simple password encryption for storage (base64 encoding)"""
-        try:
-            import base64
-            # Simple base64 encoding - not cryptographically secure but better than plaintext
-            # In production, use proper encryption like Fernet
-            encoded = base64.b64encode(password.encode('utf-8')).decode('utf-8')
-            return f"enc:{encoded}"
-        except Exception as e:
-            logging.error(f"Error encrypting password: {e}")
-            return password
+        """Deprecated wrapper to config_store.encrypt_password."""
+        return cs_encrypt_password(password)
     
     def _decrypt_password(self, encrypted_password):
-        """Simple password decryption from storage"""
-        try:
-            if encrypted_password.startswith('enc:'):
-                import base64
-                encoded = encrypted_password[4:]  # Remove 'enc:' prefix
-                decoded = base64.b64decode(encoded.encode('utf-8')).decode('utf-8')
-                return decoded
-            else:
-                # Not encrypted, return as-is (for backward compatibility)
-                return encrypted_password
-        except Exception as e:
-            logging.error(f"Error decrypting password: {e}")
-            return encrypted_password
+        """Deprecated wrapper to config_store.decrypt_password."""
+        return cs_decrypt_password(encrypted_password)
     
     def quit_app_legacy(self):
         """Deprecated: retained to avoid method name override. Do not use."""

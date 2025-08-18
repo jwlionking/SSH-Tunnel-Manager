@@ -14,9 +14,9 @@ def build_exe():
     """Build the executable using PyInstaller"""
     print("Building executable...")
     
-    # PyInstaller command
+    # PyInstaller command (invoke via the running Python to avoid PATH issues)
     cmd = [
-        "pyinstaller",
+        sys.executable, "-m", "PyInstaller",
         "--onefile",                    # Single executable file
         "--windowed",                   # No console window
         "--name=SSH_Tunnel_Manager",    # Executable name

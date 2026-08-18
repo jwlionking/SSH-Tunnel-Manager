@@ -1,11 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
     ['tunnel_manager.py'],
     pathex=[],
     binaries=[],
-    datas=[('tunnel_manager.ini', '.')],
+    datas=[],
     hiddenimports=['pystray._win32', 'PIL._tkinter_finder'],
     hookspath=[],
     hooksconfig={},

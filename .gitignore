@@ -15,7 +15,6 @@ ENV/
 # Build artifacts
 build/
 dist/
-*.spec
 *.exe
 *.dll
 

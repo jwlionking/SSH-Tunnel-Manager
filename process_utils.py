@@ -1,16 +1,16 @@
 import logging
-import psutil
 import time
-from typing import Dict, List, Any
+from typing import Any, Dict, List, Optional
+
+import psutil
+
+from ssh_utils import ports_match
 
 
 def extract_user_host(cmdline: str) -> str:
-    """Extract user@host from SSH command line."""
     try:
-        parts = cmdline.split()
-        # Find the last token that looks like user@host
-        for part in reversed(parts):
-            if '@' in part and not part.startswith('-'):
+        for part in reversed(cmdline.split()):
+            if "@" in part and not part.startswith("-") and "://" not in part:
                 return part
         return "Unknown"
     except Exception:
@@ -18,95 +18,115 @@ def extract_user_host(cmdline: str) -> str:
 
 
 def extract_port_mappings(cmdline: str) -> str:
-    """Extract -R port mappings from SSH command line into a concise string."""
     try:
         parts = cmdline.split()
         mappings: List[str] = []
-        for i, p in enumerate(parts):
-            if p == '-R' and i + 1 < len(parts):
-                mappings.append(parts[i + 1])
-        return ', '.join(mappings) if mappings else '-'
+        for index, token in enumerate(parts):
+            if token == "-R" and index + 1 < len(parts):
+                mappings.append(parts[index + 1])
+        return ", ".join(mappings) if mappings else "-"
     except Exception:
-        return '-'
+        return "-"
 
 
 def format_duration(seconds: int) -> str:
-    """Format seconds into human-readable duration."""
     try:
-        seconds = int(seconds)
+        seconds = max(0, int(seconds))
         if seconds < 60:
             return f"{seconds}s"
-        minutes, s = divmod(seconds, 60)
+        minutes, secs = divmod(seconds, 60)
         if minutes < 60:
-            return f"{minutes}m {s}s"
-        hours, m = divmod(minutes, 60)
+            return f"{minutes}m {secs}s"
+        hours, minutes = divmod(minutes, 60)
         if hours < 24:
-            return f"{hours}h {m}m"
-        days, h = divmod(hours, 24)
-        return f"{days}d {h}h"
+            return f"{hours}h {minutes}m"
+        days, hours = divmod(hours, 24)
+        return f"{days}d {hours}h"
     except Exception:
         return "-"
 
 
 def scan_ssh_tunnels() -> Dict[int, Dict[str, Any]]:
-    """Scan the system for ssh -R reverse tunnel processes.
-    Returns a dict keyed by PID with metadata.
-    """
+    """Scan for ssh reverse-tunnel processes. Keyed by PID."""
     results: Dict[int, Dict[str, Any]] = {}
     try:
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
             try:
-                name = (proc.info.get('name') or proc.name() or '').lower()
-                cmd = proc.info.get('cmdline') or proc.cmdline() or []
-                if name in ('ssh', 'ssh.exe') and cmd:
-                    cmdline = ' '.join(cmd)
-                    if '-R' in cmdline and '@' in cmdline:
-                        results[proc.pid] = {
-                            'pid': proc.pid,
-                            'cmdline': cmdline,
-                            'create_time': proc.info.get('create_time') or proc.create_time(),
-                            'user_host': extract_user_host(cmdline),
-                            'ports': extract_port_mappings(cmdline),
-                        }
+                name = (proc.info.get("name") or "").lower()
+                cmd = proc.info.get("cmdline") or []
+                if name not in {"ssh", "ssh.exe"} or not cmd:
+                    continue
+                cmdline = " ".join(cmd)
+                if "-R" not in cmd and "-R" not in cmdline:
+                    continue
+                results[proc.pid] = {
+                    "pid": proc.pid,
+                    "cmdline": cmdline,
+                    "create_time": proc.info.get("create_time") or time.time(),
+                    "user_host": extract_user_host(cmdline),
+                    "ports": extract_port_mappings(cmdline),
+                }
             except (psutil.NoSuchProcess, psutil.AccessDenied, IndexError):
                 continue
-    except Exception as e:
-        logging.error(f"Error scanning SSH processes: {e}")
+    except Exception as exc:
+        logging.error("Error scanning SSH processes: %s", exc)
     return results
 
 
+def find_matching_process(
+    processes: Dict[int, Dict[str, Any]],
+    user_host: str,
+    ports: str,
+    last_pid: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    if last_pid:
+        info = processes.get(int(last_pid))
+        if info and user_host in info.get("user_host", "") and ports_match(ports, info.get("ports", "")):
+            return info
+    for info in processes.values():
+        if user_host in info.get("user_host", "") and ports_match(ports, info.get("ports", "")):
+            return info
+    return None
+
+
 def list_external_tunnels() -> List[Dict[str, Any]]:
-    """Return a list of external ssh -R tunnel processes with friendly fields."""
-    out: List[Dict[str, Any]] = []
     now = time.time()
+    out: List[Dict[str, Any]] = []
     for info in scan_ssh_tunnels().values():
-        duration = format_duration(int(now - info.get('create_time', now)))
-        out.append({
-            'pid': info['pid'],
-            'user_host': info.get('user_host', ''),
-            'ports': info.get('ports', ''),
-            'duration': duration,
-            'cmdline': info.get('cmdline', ''),
-        })
+        out.append(
+            {
+                "pid": info["pid"],
+                "user_host": info.get("user_host", ""),
+                "ports": info.get("ports", ""),
+                "duration": format_duration(int(now - info.get("create_time", now))),
+                "create_time": info.get("create_time", now),
+                "cmdline": info.get("cmdline", ""),
+            }
+        )
     return out
 
 
-def stop_all_ssh_tunnels(timeout: float = 3.0) -> int:
-    """Attempt to terminate all detected ssh -R tunnel processes. Returns count stopped."""
-    count = 0
-    procs = list(scan_ssh_tunnels().values())
-    for info in procs:
-        pid = info['pid']
+def terminate_pid(pid: int, timeout: float = 5.0) -> bool:
+    try:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return False
+    try:
+        proc.terminate()
         try:
-            p = psutil.Process(pid)
-            p.terminate()
-            try:
-                p.wait(timeout=timeout)
-            except psutil.TimeoutExpired:
-                p.kill()
+            proc.wait(timeout=timeout)
+        except psutil.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+        logging.debug("Could not stop pid %s: %s", pid, exc)
+        return False
+
+
+def stop_all_ssh_tunnels(timeout: float = 3.0) -> int:
+    count = 0
+    for info in list(scan_ssh_tunnels().values()):
+        if terminate_pid(info["pid"], timeout=timeout):
             count += 1
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        except Exception as e:
-            logging.debug(f"Failed stopping pid {pid}: {e}")
     return count

@@ -9,12 +9,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from logger_utils import LOG_FILE
-from ssh_utils import build_ssh_command, validate_ports, wrap_password_command
+from ssh_utils import TUNNEL_TYPE_LABELS, TUNNEL_TYPES, build_ssh_command, normalize_tunnel_type, validate_ports, wrap_password_command
 
 
 def create_widgets(m):
     m.root = tk.Tk()
-    m.root.title("SSH Reverse Tunnel Manager")
+    m.root.title("SSH Tunnel Manager")
     m.root.geometry("1100x720")
     m.root.minsize(860, 560)
     m.root.protocol("WM_DELETE_WINDOW", m.on_closing)
@@ -157,19 +157,21 @@ def create_tunnels_tab(m):
     list_frame = ttk.LabelFrame(m.tunnels_frame, text="Grouped by connection", padding=10)
     list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(10, 12))
 
-    columns = ("Name", "Ports", "Description", "Status", "PID", "Duration")
+    columns = ("Name", "Type", "Ports", "Description", "Status", "PID", "Duration")
     m.tunnel_tree = ttk.Treeview(list_frame, columns=columns, show="tree headings", height=12)
     m.tunnel_tree.heading("#0", text="Connection")
     m.tunnel_tree.heading("Name", text="Tunnel")
+    m.tunnel_tree.heading("Type", text="Type")
     m.tunnel_tree.heading("Ports", text="Port mappings")
     m.tunnel_tree.heading("Description", text="Description")
     m.tunnel_tree.heading("Status", text="Status")
     m.tunnel_tree.heading("PID", text="PID")
     m.tunnel_tree.heading("Duration", text="Uptime")
-    m.tunnel_tree.column("#0", width=200)
-    m.tunnel_tree.column("Name", width=140)
-    m.tunnel_tree.column("Ports", width=150)
-    m.tunnel_tree.column("Description", width=180)
+    m.tunnel_tree.column("#0", width=180)
+    m.tunnel_tree.column("Name", width=120)
+    m.tunnel_tree.column("Type", width=80, anchor=tk.CENTER)
+    m.tunnel_tree.column("Ports", width=140)
+    m.tunnel_tree.column("Description", width=160)
     m.tunnel_tree.column("Status", width=90, anchor=tk.CENTER)
     m.tunnel_tree.column("PID", width=70, anchor=tk.CENTER)
     m.tunnel_tree.column("Duration", width=90, anchor=tk.CENTER)
@@ -367,7 +369,7 @@ def on_window_unfocus(m, event=None):
 def tunnel_config_dialog(m, existing_config=None, prefill=None):
     dialog = tk.Toplevel(m.root)
     dialog.title("Add Tunnel" if not existing_config else "Edit Tunnel")
-    dialog.geometry("720x680")
+    dialog.geometry("720x740")
     dialog.resizable(False, False)
     dialog.transient(m.root)
     dialog.grab_set()
@@ -396,7 +398,43 @@ def tunnel_config_dialog(m, existing_config=None, prefill=None):
     name_entry = labeled_entry(fields_frame, "Tunnel name")
     user_entry = labeled_entry(fields_frame, "Username")
     host_entry = labeled_entry(fields_frame, "Host / IP address")
-    ports_entry = labeled_entry(fields_frame, "Port mappings (remote:local, comma-separated)")
+
+    ttk.Label(fields_frame, text="Tunnel type", style="Heading.TLabel").pack(anchor=tk.W)
+    type_row = ttk.Frame(fields_frame)
+    type_row.pack(fill=tk.X, pady=(5, 10))
+    type_var = tk.StringVar(value="reverse")
+    type_combo = ttk.Combobox(
+        type_row,
+        textvariable=type_var,
+        values=list(TUNNEL_TYPES),
+        state="readonly",
+        width=16,
+    )
+    type_combo.pack(side=tk.LEFT)
+    type_hint = ttk.Label(type_row, text=TUNNEL_TYPE_LABELS["reverse"], foreground="#6c757d")
+    type_hint.pack(side=tk.LEFT, padx=(10, 0))
+
+    ports_label = ttk.Label(fields_frame, text="Port mappings (remote:local, comma-separated)", style="Heading.TLabel")
+    ports_label.pack(anchor=tk.W)
+    ports_entry = ttk.Entry(fields_frame, font=("Segoe UI", 10), width=50)
+    ports_entry.pack(fill=tk.X, pady=(5, 4))
+    ports_hint = ttk.Label(fields_frame, text="Example: 8080:8080  (remote 8080 → this PC 8080)", foreground="#6c757d")
+    ports_hint.pack(anchor=tk.W, pady=(0, 10))
+
+    def update_type_hints(*_args):
+        kind = normalize_tunnel_type(type_var.get())
+        type_hint.config(text=TUNNEL_TYPE_LABELS.get(kind, kind))
+        if kind == "local":
+            ports_label.config(text="Port mappings (local:remote, comma-separated)")
+            ports_hint.config(text="Example: 4000:4000  (this PC 4000 → remote 4000)")
+        elif kind == "dynamic":
+            ports_label.config(text="SOCKS listen port")
+            ports_hint.config(text="Example: 1080  (local SOCKS5 proxy)")
+        else:
+            ports_label.config(text="Port mappings (remote:local, comma-separated)")
+            ports_hint.config(text="Example: 8080:8080  (remote 8080 → this PC 8080)")
+
+    type_combo.bind("<<ComboboxSelected>>", update_type_hints)
 
     ttk.Label(fields_frame, text="SSH port", style="Heading.TLabel").pack(anchor=tk.W)
     port_row = ttk.Frame(fields_frame)
@@ -460,6 +498,8 @@ def tunnel_config_dialog(m, existing_config=None, prefill=None):
         name_entry.insert(0, existing_config["name"])
         user_entry.insert(0, existing_config["user"])
         host_entry.insert(0, existing_config["host"])
+        type_var.set(normalize_tunnel_type(existing_config.get("tunnel_type", "reverse")))
+        update_type_hints()
         ports_entry.insert(0, existing_config["ports"])
         desc_entry.insert(0, existing_config.get("description", ""))
         identity_entry.insert(0, existing_config.get("identity_file", ""))
@@ -485,6 +525,7 @@ def tunnel_config_dialog(m, existing_config=None, prefill=None):
         user = user_entry.get().strip()
         host = host_entry.get().strip()
         ports = ports_entry.get().strip()
+        tunnel_type = normalize_tunnel_type(type_var.get())
         description = desc_entry.get().strip()
         auth_method = auth_var.get()
         password = password_entry.get() if auth_method == "password" else ""
@@ -498,7 +539,7 @@ def tunnel_config_dialog(m, existing_config=None, prefill=None):
             messagebox.showerror("Name Exists", "A tunnel with this name already exists.", parent=dialog)
             return
         try:
-            validate_ports(ports)
+            validate_ports(ports, tunnel_type)
             port_num = int(ssh_port)
             if port_num < 1 or port_num > 65535:
                 raise ValueError("SSH port out of range")
@@ -514,6 +555,7 @@ def tunnel_config_dialog(m, existing_config=None, prefill=None):
             "user": user,
             "host": host,
             "ports": ports,
+            "tunnel_type": tunnel_type,
             "description": description,
             "auth_method": auth_method,
             "password": password if auth_method == "password" else "",
@@ -590,26 +632,37 @@ def show_external_tunnels_dialog(m, processes):
     ttk.Label(main_frame, text="External SSH tunnel processes", style="Title.TLabel").pack(pady=(0, 12))
     ttk.Label(
         main_frame,
-        text="These ssh -R processes are running on this machine. Stop one, or leave them alone.",
+        text="These ssh -R / -L / -D processes are running on this machine. Stop one, or leave them alone.",
         foreground="#6c757d",
     ).pack(pady=(0, 12))
 
     list_frame = ttk.Frame(main_frame)
     list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
-    columns = ("PID", "Connection", "Ports", "Uptime")
+    columns = ("PID", "Type", "Connection", "Ports", "Uptime")
     tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=8)
     for col, label, width, anchor in (
-        ("PID", "PID", 80, tk.CENTER),
-        ("Connection", "User@Host", 240, tk.W),
-        ("Ports", "Port mappings", 240, tk.W),
-        ("Uptime", "Uptime", 120, tk.CENTER),
+        ("PID", "PID", 70, tk.CENTER),
+        ("Type", "Type", 80, tk.CENTER),
+        ("Connection", "User@Host", 220, tk.W),
+        ("Ports", "Port mappings", 220, tk.W),
+        ("Uptime", "Uptime", 100, tk.CENTER),
     ):
         tree.heading(col, text=label)
         tree.column(col, width=width, anchor=anchor)
 
     for proc in processes:
         uptime = proc.get("duration") or m.format_duration(int(time.time() - proc.get("create_time", time.time())))
-        tree.insert("", tk.END, values=(proc["pid"], proc.get("user_host", ""), proc.get("ports", ""), uptime))
+        tree.insert(
+            "",
+            tk.END,
+            values=(
+                proc["pid"],
+                proc.get("tunnel_type", "reverse"),
+                proc.get("user_host", ""),
+                proc.get("ports", ""),
+                uptime,
+            ),
+        )
 
     scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
     tree.configure(yscrollcommand=scrollbar.set)
@@ -717,12 +770,13 @@ def view_tunnel_details(m):
         if not values:
             messagebox.showwarning("Invalid Selection", "Select a specific tunnel under a connection.")
             return
-        name, ports, _desc, status, pid_str, duration = values[:6]
+        name, tunnel_type, ports, _desc, status, pid_str, duration = values[:7]
         connection = m.get_connection_for_item(item)
         saved = m._saved_tunnels.get(name, {})
         extra = ""
         if saved:
             extra = (
+                f"\nType: {TUNNEL_TYPE_LABELS.get(normalize_tunnel_type(saved.get('tunnel_type', tunnel_type)), tunnel_type)}"
                 f"\nAuth: {saved.get('auth_method', 'key')}"
                 f"\nSSH port: {saved.get('ssh_port', '22')}"
                 f"\nIdentity: {saved.get('identity_file') or '(default agent/keys)'}"
@@ -731,12 +785,12 @@ def view_tunnel_details(m):
         if pid_str == "-":
             messagebox.showinfo(
                 "Tunnel Details",
-                f"Name: {name}\nConnection: {connection}\nPorts: {ports}\nStatus: {status}\nUptime: {duration}{extra}",
+                f"Name: {name}\nConnection: {connection}\nType: {tunnel_type}\nPorts: {ports}\nStatus: {status}\nUptime: {duration}{extra}",
             )
             return
         proc = psutil.Process(int(pid_str))
         info = (
-            f"Name: {name}\nPID: {pid_str}\nConnection: {connection}\nPorts: {ports}\n"
+            f"Name: {name}\nPID: {pid_str}\nConnection: {connection}\nType: {tunnel_type}\nPorts: {ports}\n"
             f"Status: {status}\nUptime: {duration}{extra}\n\n"
             f"Executable: {proc.exe()}\nCommand: {' '.join(proc.cmdline())}\n"
             f"Memory: {proc.memory_info().rss / 1024 / 1024:.1f} MB\n"
@@ -762,7 +816,7 @@ def copy_tunnel_command(m):
             messagebox.showwarning("Invalid Selection", "Select a specific tunnel under a connection.")
             return
         name = values[0]
-        pid_str = values[4]
+        pid_str = values[5]
         cmdline = None
         if pid_str and pid_str != "-":
             cmdline = " ".join(psutil.Process(int(pid_str)).cmdline())
@@ -777,6 +831,7 @@ def copy_tunnel_command(m):
                     identity_file=cfg.get("identity_file", ""),
                     ssh_port=int(cfg.get("ssh_port") or 22),
                     host_key_policy=m.host_key_policy(),
+                    tunnel_type=cfg.get("tunnel_type", "reverse"),
                 )
             )
         else:

@@ -1,6 +1,6 @@
 # Tunnel Manager Notes
 
-Working desktop app for Windows reverse SSH tunnels.
+Working desktop app for Windows SSH tunnels (reverse, local, and dynamic SOCKS).
 
 ## Recently fixed
 - Duplicate methods were shadowing the real save/load path, so Settings never persisted
@@ -9,7 +9,7 @@ Working desktop app for Windows reverse SSH tunnels.
 - Password auth wrote the secret into a temp `.bat` file
 - `-vvv` and `StrictHostKeyChecking=no` were hardcoded
 - README pointed at a file that does not exist
+- Local-forward (`-L`) and dynamic SOCKS (`-D`) profiles
 
 ## Still optional
 - [ ] Test the compiled exe for tray + Windows startup
-- [ ] Optional local-forward (`-L`) and dynamic (`-D`) profiles

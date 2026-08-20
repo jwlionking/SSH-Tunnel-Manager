@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 import psutil
 
-from ssh_utils import ports_match
+from ssh_utils import extract_forward_spec, normalize_tunnel_type, ports_match
 
 
 def extract_user_host(cmdline: str) -> str:
@@ -18,15 +18,7 @@ def extract_user_host(cmdline: str) -> str:
 
 
 def extract_port_mappings(cmdline: str) -> str:
-    try:
-        parts = cmdline.split()
-        mappings: List[str] = []
-        for index, token in enumerate(parts):
-            if token == "-R" and index + 1 < len(parts):
-                mappings.append(parts[index + 1])
-        return ", ".join(mappings) if mappings else "-"
-    except Exception:
-        return "-"
+    return extract_forward_spec(cmdline)[1]
 
 
 def format_duration(seconds: int) -> str:
@@ -47,7 +39,7 @@ def format_duration(seconds: int) -> str:
 
 
 def scan_ssh_tunnels() -> Dict[int, Dict[str, Any]]:
-    """Scan for ssh reverse-tunnel processes. Keyed by PID."""
+    """Scan for ssh reverse/local/dynamic tunnel processes. Keyed by PID."""
     results: Dict[int, Dict[str, Any]] = {}
     try:
         for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
@@ -57,14 +49,16 @@ def scan_ssh_tunnels() -> Dict[int, Dict[str, Any]]:
                 if name not in {"ssh", "ssh.exe"} or not cmd:
                     continue
                 cmdline = " ".join(cmd)
-                if "-R" not in cmd and "-R" not in cmdline:
+                if not any(flag in cmd or flag in cmdline for flag in ("-R", "-L", "-D")):
                     continue
+                kind, ports = extract_forward_spec(cmdline)
                 results[proc.pid] = {
                     "pid": proc.pid,
                     "cmdline": cmdline,
                     "create_time": proc.info.get("create_time") or time.time(),
                     "user_host": extract_user_host(cmdline),
-                    "ports": extract_port_mappings(cmdline),
+                    "ports": ports,
+                    "tunnel_type": kind,
                 }
             except (psutil.NoSuchProcess, psutil.AccessDenied, IndexError):
                 continue
@@ -78,13 +72,23 @@ def find_matching_process(
     user_host: str,
     ports: str,
     last_pid: Optional[int] = None,
+    tunnel_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    want_type = normalize_tunnel_type(tunnel_type) if tunnel_type else None
+
+    def matches(info: Dict[str, Any]) -> bool:
+        if user_host not in info.get("user_host", ""):
+            return False
+        if want_type and normalize_tunnel_type(info.get("tunnel_type", "reverse")) != want_type:
+            return False
+        return ports_match(ports, info.get("ports", ""))
+
     if last_pid:
         info = processes.get(int(last_pid))
-        if info and user_host in info.get("user_host", "") and ports_match(ports, info.get("ports", "")):
+        if info and matches(info):
             return info
     for info in processes.values():
-        if user_host in info.get("user_host", "") and ports_match(ports, info.get("ports", "")):
+        if matches(info):
             return info
     return None
 
@@ -98,6 +102,7 @@ def list_external_tunnels() -> List[Dict[str, Any]]:
                 "pid": info["pid"],
                 "user_host": info.get("user_host", ""),
                 "ports": info.get("ports", ""),
+                "tunnel_type": info.get("tunnel_type", "reverse"),
                 "duration": format_duration(int(now - info.get("create_time", now))),
                 "create_time": info.get("create_time", now),
                 "cmdline": info.get("cmdline", ""),

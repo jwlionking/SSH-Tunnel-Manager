@@ -1,6 +1,6 @@
 # SSH Tunnel Manager
 
-A Windows desktop app for saving, starting, and watching SSH reverse tunnels (`ssh -R`). It has a tabbed UI and can live in the system tray.
+A Windows desktop app for saving, starting, and watching SSH tunnels. Reverse (`ssh -R`), local (`ssh -L`), and dynamic SOCKS (`ssh -D`) profiles are supported. It has a tabbed UI and can live in the system tray.
 
 ![Platform](https://img.shields.io/badge/Platform-Windows-blue)
 ![Python](https://img.shields.io/badge/Python-3.9+-green)
@@ -8,9 +8,10 @@ A Windows desktop app for saving, starting, and watching SSH reverse tunnels (`s
 
 ## Features
 
-- Save multiple reverse-tunnel profiles, grouped by `user@host`
+- Save multiple tunnel profiles, grouped by `user@host`
+- Tunnel types: **reverse** (`-R`), **local** (`-L`), **dynamic SOCKS** (`-D`)
 - Start / stop / restart one tunnel or everything under a connection
-- Detect already-running `ssh -R` processes and attach them as **External**
+- Detect already-running `ssh` forwards and attach them as **External**
 - Optional identity file, non-default SSH port, and per-tunnel auto-start
 - System tray, Windows startup, and `--headless` background mode
 - Host-key policy (`accept-new` by default — not `StrictHostKeyChecking=no`)
@@ -56,11 +57,15 @@ The binary lands in `dist/SSH_Tunnel_Manager.exe`.
 ## Usage
 
 1. Open the **Tunnels** tab and click **Add Tunnel**.
-2. Enter name, username, host, and mappings such as `8080:8080` or `8080:8080,3000:3000`.
-3. Optionally pick an identity file, SSH port, or mark the tunnel to auto-start.
-4. Save, select the row, and click **Start**.
+2. Pick a type:
+   - **reverse** — expose a port on this PC to the remote host (`8080:8080` = remote 8080 → local 8080)
+   - **local** — bring a remote port here (`4000:4000` = local 4000 → remote 4000)
+   - **dynamic** — SOCKS5 proxy on this PC (port `1080`)
+3. Enter name, username, host, and mappings.
+4. Optionally pick an identity file, SSH port, or mark the tunnel to auto-start.
+5. Save, select the row, and click **Start**.
 
-The **Connection** tab is a quick-start form. **Create & Start Tunnel** writes a saved profile named `QuickStart`.
+The **Connection** tab is a quick-start form for reverse tunnels. **Create & Start Tunnel** writes a saved profile named `QuickStart`.
 
 ### Settings
 
@@ -87,11 +92,34 @@ name = MyTunnel
 user = root
 host = 192.168.1.100
 ports = 8080:8080,3000:3000
+tunnel_type = reverse
 description = Dev box
 auth_method = key
 identity_file =
 ssh_port = 22
 auto_start = true
+
+[Tunnel_TeslaMate]
+name = TeslaMate
+user = jeremy
+host = home.lan
+ports = 4000:4000
+tunnel_type = local
+description = TeslaMate UI
+auth_method = key
+ssh_port = 22
+auto_start = true
+
+[Tunnel_Socks]
+name = Socks
+user = jeremy
+host = home.lan
+ports = 1080
+tunnel_type = dynamic
+description = SOCKS5 via home
+auth_method = key
+ssh_port = 22
+auto_start = false
 ```
 
 Password auth is supported but SSH keys are the better path. On Windows, stored passwords are protected with DPAPI. They are never written into a `.bat` file or placed on the `ssh` command line.
@@ -122,7 +150,7 @@ python -m unittest discover -s tests -v
 ## Troubleshooting
 
 **Tunnel exits immediately**  
-Open the Activity Log. Typical causes: host key prompt, wrong user, missing key in the agent, or the remote port already in use (`ExitOnForwardFailure=yes`).
+Open the Activity Log. Typical causes: host key prompt, wrong user, missing key in the agent, or the remote/local port already in use (`ExitOnForwardFailure=yes`).
 
 **Permission denied**  
 Confirm the username and that `ssh-agent` has the right key. You can point a tunnel at a specific identity file.

@@ -1,12 +1,35 @@
 """SSH command construction, port parsing, and password-askpass helpers."""
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import sys
 import tempfile
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+
+TUNNEL_TYPES = ("reverse", "local", "dynamic")
+TUNNEL_TYPE_LABELS = {
+    "reverse": "Reverse (-R)",
+    "local": "Local (-L)",
+    "dynamic": "Dynamic SOCKS (-D)",
+}
+_FLAG_TO_KIND = {"-R": "reverse", "-L": "local", "-D": "dynamic"}
+
+
+def extract_forward_spec(cmdline: str) -> Tuple[str, str]:
+    """Return (tunnel_type, mappings) from an ssh command line."""
+    try:
+        parts = cmdline.split()
+        mappings: List[str] = []
+        kind = "reverse"
+        for index, token in enumerate(parts):
+            if token in _FLAG_TO_KIND and index + 1 < len(parts) and not parts[index + 1].startswith("-"):
+                kind = _FLAG_TO_KIND[token]
+                mappings.append(parts[index + 1])
+        return kind, (", ".join(mappings) if mappings else "-")
+    except Exception:
+        return "reverse", "-"
 
 
 def known_hosts_null() -> str:
@@ -17,8 +40,27 @@ def find_ssh_executable() -> Optional[str]:
     return shutil.which("ssh")
 
 
+def normalize_tunnel_type(value: str = "") -> str:
+    raw = (value or "reverse").strip().lower()
+    aliases = {
+        "r": "reverse",
+        "-r": "reverse",
+        "reverse": "reverse",
+        "l": "local",
+        "-l": "local",
+        "local": "local",
+        "forward": "local",
+        "d": "dynamic",
+        "-d": "dynamic",
+        "dynamic": "dynamic",
+        "socks": "dynamic",
+        "socks5": "dynamic",
+    }
+    return aliases.get(raw, "reverse")
+
+
 def parse_port_pairs(ports: str) -> List[Tuple[int, int]]:
-    """Parse mappings like '8080:80', '8080:127.0.0.1:80', or bind:remote:host:local."""
+    """Parse mappings like '8080:80', '8080:127.0.0.1:80', or a single SOCKS port."""
     pairs: List[Tuple[int, int]] = []
     if not ports or ports.strip() in {"-", ""}:
         return pairs
@@ -52,11 +94,22 @@ def ports_match(saved_ports: str, process_ports: str) -> bool:
     return saved == running or saved.issubset(running)
 
 
-def build_r_flags(ports: str) -> List[str]:
+def build_forward_flags(ports: str, tunnel_type: str = "reverse") -> List[str]:
+    kind = normalize_tunnel_type(tunnel_type)
+    pairs = parse_port_pairs(ports)
+    if not pairs:
+        return []
+    if kind == "dynamic":
+        return ["-D", str(pairs[0][0])]
+    flag = "-R" if kind == "reverse" else "-L"
     flags: List[str] = []
-    for remote, local in parse_port_pairs(ports):
-        flags.extend(["-R", f"{remote}:127.0.0.1:{local}"])
+    for left, right in pairs:
+        flags.extend([flag, f"{left}:127.0.0.1:{right}"])
     return flags
+
+
+def build_r_flags(ports: str) -> List[str]:
+    return build_forward_flags(ports, "reverse")
 
 
 def build_ssh_command(
@@ -70,11 +123,17 @@ def build_ssh_command(
     ssh_port: int = 22,
     host_key_policy: str = "accept-new",
     debug: bool = False,
+    tunnel_type: str = "reverse",
 ) -> List[str]:
     if not user or not host:
         raise ValueError("Username and host are required.")
-    if not test and not parse_port_pairs(ports):
-        raise ValueError("At least one valid port mapping is required (e.g. 8080:8080).")
+    kind = normalize_tunnel_type(tunnel_type)
+    if not test:
+        if kind == "dynamic":
+            if not parse_port_pairs(ports):
+                raise ValueError("A SOCKS listen port is required (e.g. 1080).")
+        elif not parse_port_pairs(ports):
+            raise ValueError("At least one valid port mapping is required (e.g. 8080:8080).")
 
     cmd: List[str] = ["ssh"]
     if debug:
@@ -134,7 +193,7 @@ def build_ssh_command(
         cmd.extend([f"{user}@{host}", "echo", "SSH connection successful"])
         return cmd
 
-    cmd.extend(build_r_flags(ports))
+    cmd.extend(build_forward_flags(ports, kind))
     cmd.extend(["-N", f"{user}@{host}"])
     return cmd
 
@@ -197,10 +256,23 @@ def redact_command(cmd: Iterable[str]) -> str:
     return " ".join(str(part) for part in cmd)
 
 
-def validate_ports(ports: str) -> None:
+def validate_ports(ports: str, tunnel_type: str = "reverse") -> None:
+    kind = normalize_tunnel_type(tunnel_type)
+    if kind == "dynamic":
+        token = (ports or "").strip()
+        if not token or "," in token:
+            raise ValueError("Dynamic SOCKS needs a single local port, e.g. 1080.")
+        try:
+            port = int(token.split(":")[-1])
+        except ValueError as exc:
+            raise ValueError("Dynamic SOCKS port must be a number, e.g. 1080.") from exc
+        if port < 1 or port > 65535:
+            raise ValueError("SOCKS port must be between 1 and 65535.")
+        return
     if not parse_port_pairs(ports):
         raise ValueError("Port mappings must look like 8080:80 or 8080:8080,9000:9000.")
+    hint = "local:remote" if kind == "local" else "remote:local"
     for raw in ports.split(","):
         token = raw.strip()
         if token and ":" not in token:
-            raise ValueError(f"Invalid port mapping '{token}'. Use remote:local.")
+            raise ValueError(f"Invalid port mapping '{token}'. Use {hint}.")

@@ -211,7 +211,13 @@ class TunnelManager:
                         last_pid = int(config["last_pid"])
                 except (TypeError, ValueError):
                     last_pid = None
-                info = pu.find_matching_process(processes, user_host, config.get("ports", ""), last_pid)
+                info = pu.find_matching_process(
+                    processes,
+                    user_host,
+                    config.get("ports", ""),
+                    last_pid,
+                    config.get("tunnel_type", "reverse"),
+                )
                 if info:
                     self.save_tunnel_pid(name, info["pid"])
                     config["last_pid"] = str(info["pid"])
@@ -248,7 +254,12 @@ class TunnelManager:
                 return True
         processes = self._get_cached_ssh_processes()
         user_host = f"{info['user']}@{info['host']}"
-        return pu.find_matching_process(processes, user_host, info.get("ports", "")) is not None
+        return pu.find_matching_process(
+            processes,
+            user_host,
+            info.get("ports", ""),
+            tunnel_type=info.get("tunnel_type", "reverse"),
+        ) is not None
 
     def _get_cached_ssh_processes(self, force_refresh: bool = False) -> Dict[int, Dict[str, Any]]:
         now = time.time()
@@ -304,7 +315,7 @@ class TunnelManager:
         if not item:
             return
         values = self.tunnel_tree.item(item, "values")
-        name, status = values[0], values[3]
+        name, status = values[0], values[4]
         if "Active" in status or "External" in status:
             self.notify("Already Running", f"'{name}' is already running.")
             return
@@ -318,7 +329,7 @@ class TunnelManager:
         if not item:
             return
         values = self.tunnel_tree.item(item, "values")
-        name, status = values[0], values[3]
+        name, status = values[0], values[4]
         if "Active" in status or "External" in status:
             self.notify("Cannot Delete", "Stop the tunnel before deleting its configuration.", "warning")
             return
@@ -363,6 +374,7 @@ class TunnelManager:
                 ssh_port=ssh_port,
                 host_key_policy=self.host_key_policy(),
                 debug=DEBUG_MODE,
+                tunnel_type=config.get("tunnel_type", "reverse"),
             )
             env = None
             if config.get("auth_method") == "password":
@@ -453,6 +465,7 @@ class TunnelManager:
                 "user": user,
                 "host": host,
                 "ports": ports,
+                "tunnel_type": "reverse",
                 "description": "Quick start tunnel from Connection tab",
                 "auth_method": "key",
                 "auto_start": False,
@@ -471,7 +484,7 @@ class TunnelManager:
         try:
             processes = pu.list_external_tunnels()
             if not processes:
-                self.notify("No External Tunnels", "No SSH reverse-tunnel processes found.")
+                self.notify("No External Tunnels", "No SSH tunnel processes (-R / -L / -D) found.")
                 return
             self.show_external_tunnels_dialog(processes)
         except Exception as exc:
@@ -706,6 +719,7 @@ class TunnelManager:
                             user_host,
                             config.get("ports", ""),
                             int(config["last_pid"]) if str(config.get("last_pid") or "").isdigit() else None,
+                            config.get("tunnel_type", "reverse"),
                         )
                         if match:
                             running_pid = match["pid"]
@@ -718,6 +732,7 @@ class TunnelManager:
                         "end",
                         values=(
                             name,
+                            config.get("tunnel_type", "reverse"),
                             config.get("ports", ""),
                             config.get("description", ""),
                             status,
@@ -773,7 +788,7 @@ class TunnelManager:
             return
         values = self.tunnel_tree.item(item, "values")
         name = values[0]
-        pid_str = values[4]
+        pid_str = values[5]
         if pid_str == "-":
             self.notify("No Process", "This tunnel is not currently running.", "warning")
             return
@@ -829,7 +844,7 @@ class TunnelManager:
             return
         values = self.tunnel_tree.item(item, "values")
         name = values[0]
-        pid_str = values[4]
+        pid_str = values[5]
         if name not in self._saved_tunnels:
             self.notify("Not Managed", "This tunnel is not a saved configuration.", "warning")
             return
@@ -866,7 +881,7 @@ class TunnelManager:
                 if not cvals:
                     continue
                 name = cvals[0]
-                pid_str = cvals[4] if len(cvals) > 4 else "-"
+                pid_str = cvals[5] if len(cvals) > 5 else "-"
                 try:
                     if pid_str and pid_str != "-":
                         pu.terminate_pid(int(pid_str))

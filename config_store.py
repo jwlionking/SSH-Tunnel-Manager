@@ -6,6 +6,8 @@ import sys
 import tempfile
 from typing import Any, Dict, Optional
 
+from ssh_utils import normalize_tunnel_type
+
 
 def _dirname(path: str) -> str:
     return os.path.dirname(os.path.abspath(path))
@@ -148,6 +150,7 @@ def load_saved_tunnels(config: configparser.ConfigParser, config_file: str) -> D
                 "user": section.get("user", ""),
                 "host": section.get("host", ""),
                 "ports": section.get("ports", ""),
+                "tunnel_type": normalize_tunnel_type(section.get("tunnel_type", "reverse")),
                 "description": section.get("description", ""),
                 "auth_method": section.get("auth_method", "key"),
                 "password": decrypt_password(password) if password else "",
@@ -183,6 +186,7 @@ def save_tunnel_config(
     section["user"] = tunnel_config["user"]
     section["host"] = tunnel_config["host"]
     section["ports"] = tunnel_config["ports"]
+    section["tunnel_type"] = normalize_tunnel_type(tunnel_config.get("tunnel_type", "reverse"))
     section["description"] = tunnel_config.get("description", "")
     section["auth_method"] = tunnel_config.get("auth_method", "key")
     section["identity_file"] = tunnel_config.get("identity_file", "")
